@@ -349,6 +349,7 @@ dependencies = [
  "dashu-base",
  "num-modular",
  "num-order",
+ "num-traits",
  "rustversion",
  "static_assertions",
 ]
@@ -471,7 +472,6 @@ name = "fractals-rs"
 version = "0.1.0"
 dependencies = [
  "dashu-int",
- "num-bigint",
  "num-traits",
  "pollster",
  "rayon",
@@ -828,25 +828,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ee6cda3051665f1fb8d9e08fc35c96d5a244fb1be711a03b71118828afc9a873"
 dependencies = [
  "jni-sys 0.3.1",
-]
-
-[[package]]
-name = "num-bigint"
-version = "0.4.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a5e44f723f1133c9deac646763579fdb3ac745e418f2a7af9cd0c431da1f20b9"
-dependencies = [
- "num-integer",
- "num-traits",
-]
-
-[[package]]
-name = "num-integer"
-version = "0.1.46"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7969661fd2958a5cb096e56c8e1ad0444ac2bbcd0061bd28660485a44879858f"
-dependencies = [
- "num-traits",
 ]
 
 [[package]]

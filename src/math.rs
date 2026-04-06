@@ -1,4 +1,4 @@
-use num_bigint::BigInt;
+use dashu_int::{IBig, ops::BitTest};
 use num_traits::{Signed, ToPrimitive, Zero};
 use winit::dpi::PhysicalPosition;
 
@@ -8,7 +8,7 @@ const PIXEL_PRECISION_GUARD_BITS: u32 = 96;
 
 #[derive(Clone, Debug)]
 pub struct BigFixed {
-    pub raw: BigInt,
+    pub raw: IBig,
     pub frac_bits: u32,
 }
 
@@ -16,7 +16,7 @@ impl BigFixed {
     pub fn from_f64(value: f64, frac_bits: u32) -> Self {
         if !value.is_finite() || value == 0.0 {
             return Self {
-                raw: BigInt::zero(),
+                raw: IBig::zero(),
                 frac_bits,
             };
         }
@@ -32,7 +32,7 @@ impl BigFixed {
             ((1_u64 << 52) | mantissa_bits, exponent_bits - 1023 - 52)
         };
 
-        let mut raw = BigInt::from(mantissa);
+        let mut raw = IBig::from(mantissa);
         let shift = exponent as i64 + frac_bits as i64;
         if shift >= 0 {
             raw <<= shift as usize;
@@ -51,11 +51,11 @@ impl BigFixed {
         match new_frac_bits.cmp(&self.frac_bits) {
             std::cmp::Ordering::Equal => self.clone(),
             std::cmp::Ordering::Greater => Self {
-                raw: &self.raw << (new_frac_bits - self.frac_bits),
+                raw: &self.raw << (new_frac_bits - self.frac_bits) as usize,
                 frac_bits: new_frac_bits,
             },
             std::cmp::Ordering::Less => Self {
-                raw: &self.raw >> (self.frac_bits - new_frac_bits),
+                raw: &self.raw >> (self.frac_bits - new_frac_bits) as usize,
                 frac_bits: new_frac_bits,
             },
         }
@@ -91,7 +91,7 @@ impl BigFixed {
             return Some(value.log10());
         }
 
-        let bits = self.raw.bits();
+        let bits = self.raw.bit_len();
         if bits == 0 {
             return None;
         }
@@ -100,7 +100,7 @@ impl BigFixed {
     }
 
     pub fn abs_log2_estimate(&self) -> Option<f64> {
-        let bits = self.raw.bits();
+        let bits = self.raw.bit_len();
         if bits == 0 {
             return None;
         }
@@ -113,18 +113,18 @@ impl BigFixed {
     }
 }
 
-pub fn mul_fixed_raw(lhs: &BigInt, rhs: &BigInt, frac_bits: u32) -> BigInt {
-    (lhs * rhs) >> frac_bits
+pub fn mul_fixed_raw(lhs: &IBig, rhs: &IBig, frac_bits: u32) -> IBig {
+    (lhs * rhs) >> frac_bits as usize
 }
 
-pub fn raw_to_f64(raw: &BigInt, frac_bits: u32) -> f64 {
+pub fn raw_to_f64(raw: &IBig, frac_bits: u32) -> f64 {
     if raw.is_zero() {
         return 0.0;
     }
 
     let negative = raw.is_negative();
     let abs = raw.abs();
-    let bits = abs.bits() as i64;
+    let bits = abs.bit_len() as i64;
     let mantissa_bits = 53_i64;
     let shift = (bits - mantissa_bits).max(0);
     let mantissa = (&abs >> shift as usize).to_u64().unwrap_or(u64::MAX);

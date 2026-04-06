@@ -19,7 +19,7 @@ use crate::{
     math::ViewportState,
     render::{
         RenderMessage, RenderRequest, RenderStrategy, build_preview_frame, overlay_tile_grid,
-        render_strategy_for_viewport, spawn_render_worker,
+        patch_exact_pixels, prepare_gpu_render, render_strategy_for_viewport, spawn_render_worker,
     },
 };
 
@@ -58,19 +58,45 @@ impl FractalApp {
         let Some(viewport) = self.viewport.as_ref() else {
             return;
         };
-        let Some(render_tx) = self.render_tx.as_ref() else {
-            return;
-        };
         let Some(latest_requested_generation) = self.latest_requested_generation.as_ref() else {
             return;
         };
 
         let generation = self.next_generation;
+        let request = RenderRequest::from_viewport(viewport, generation);
+        let viewport_snapshot = viewport.clone();
         latest_requested_generation.store(generation, Ordering::Relaxed);
-        if render_tx
-            .send(RenderRequest::from_viewport(viewport, generation))
-            .is_ok()
-        {
+
+        if let Some(renderer) = self.renderer.as_mut() {
+            if renderer.supports_fractal_compute() {
+                if let Some(gpu_params) = prepare_gpu_render(&request) {
+                    if let Some(mut output) = renderer.render_fractal_to_pixels(&gpu_params) {
+                        if output.fallback_mask.iter().any(|flag| *flag != 0) {
+                            patch_exact_pixels(&request, &mut output.pixels, &output.fallback_mask);
+                        }
+
+                        self.pending_tiles.clear();
+                        self.displayed_viewport = Some(viewport_snapshot.clone());
+                        self.displayed_generation = generation;
+                        self.displayed_pixels = output.pixels;
+                        renderer.upload_full(
+                            viewport_snapshot.width,
+                            viewport_snapshot.height,
+                            &self.displayed_pixels,
+                        );
+                        renderer.window.request_redraw();
+                        self.next_generation += 1;
+                        return;
+                    }
+                }
+            }
+        }
+
+        let Some(render_tx) = self.render_tx.as_ref() else {
+            return;
+        };
+
+        if render_tx.send(request).is_ok() {
             self.next_generation += 1;
         }
     }

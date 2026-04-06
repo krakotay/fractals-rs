@@ -7,7 +7,7 @@ use std::{
     thread,
 };
 
-use num_bigint::BigInt;
+use dashu_int::IBig;
 use num_traits::Zero;
 use rayon::prelude::*;
 
@@ -67,6 +67,17 @@ struct ReferenceOrbit {
     series_a_imag: Vec<f64>,
     series_b_real: Vec<f64>,
     series_b_imag: Vec<f64>,
+}
+
+pub enum GpuRenderParams {
+    FastF64 {
+        width: u32,
+        height: u32,
+        center_x: f64,
+        center_y: f64,
+        scale: f64,
+        max_iterations: u32,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -149,6 +160,31 @@ fn render_strategy_for_request(request: &RenderRequest) -> RenderStrategy {
         request.width,
         request.height,
     )
+}
+
+pub fn prepare_gpu_render(request: &RenderRequest) -> Option<GpuRenderParams> {
+    let width = request.width;
+    let height = request.height;
+    let center_x = request.center_x.to_f64();
+    let center_y = request.center_y.to_f64();
+    let scale = request.scale.to_f64();
+
+    if !center_x.is_finite() || !center_y.is_finite() || !scale.is_finite() || scale == 0.0 {
+        return None;
+    }
+
+    match render_strategy_for_request(request) {
+        RenderStrategy::FastF64 => Some(GpuRenderParams::FastF64 {
+            width,
+            height,
+            center_x,
+            center_y,
+            scale,
+            max_iterations: request.max_iterations,
+        }),
+        RenderStrategy::Perturbation => None,
+        RenderStrategy::Exact => None,
+    }
 }
 
 fn render_strategy_for_geometry(
@@ -405,6 +441,52 @@ fn render_tile_fixed(request: &RenderRequest, tile: TileRect) -> Vec<u8> {
     pixels
 }
 
+pub fn patch_exact_pixels(request: &RenderRequest, pixels: &mut [u8], fallback_mask: &[u8]) {
+    if request.width == 0 || request.height == 0 || fallback_mask.is_empty() {
+        return;
+    }
+
+    let width = request.width as usize;
+    let row_stride = width * 4;
+    let frac_bits = request.frac_bits;
+    let half_width = request.width as f64 * 0.5;
+    let half_height = request.height as f64 * 0.5;
+
+    pixels
+        .par_chunks_mut(row_stride)
+        .enumerate()
+        .for_each(|(y, row_pixels)| {
+            let mask_row_start = y * width;
+            let mask_row = &fallback_mask[mask_row_start..mask_row_start + width];
+            if mask_row.iter().all(|flag| *flag == 0) {
+                return;
+            }
+
+            let start_x = BigFixed::from_f64(-half_width, frac_bits);
+            let y_fixed = BigFixed::from_f64(y as f64 - half_height, frac_bits);
+            let start_real =
+                &request.center_x.raw + mul_fixed_raw(&request.scale.raw, &start_x.raw, frac_bits);
+            let imag =
+                &request.center_y.raw + mul_fixed_raw(&request.scale.raw, &y_fixed.raw, frac_bits);
+
+            for (x, flag) in mask_row.iter().copied().enumerate() {
+                if flag == 0 {
+                    continue;
+                }
+
+                let x_fixed = BigFixed::from_f64(x as f64 - half_width, frac_bits);
+                let real =
+                    &request.center_x.raw + mul_fixed_raw(&request.scale.raw, &x_fixed.raw, frac_bits);
+                let color =
+                    mandelbrot_color_fixed(&real, &imag, request.max_iterations, request.frac_bits);
+                let offset = x * 4;
+                row_pixels[offset..offset + 4].copy_from_slice(&color);
+            }
+
+            let _ = start_real;
+        });
+}
+
 fn render_tile_perturbation(
     request: &RenderRequest,
     tile: TileRect,
@@ -471,8 +553,8 @@ fn build_reference_orbit(request: &RenderRequest) -> ReferenceOrbit {
 
 fn build_reference_orbit_at_offset(
     request: &RenderRequest,
-    offset_real: &BigInt,
-    offset_imag: &BigInt,
+    offset_real: &IBig,
+    offset_imag: &IBig,
 ) -> ReferenceOrbit {
     build_reference_orbit_for_point(
         &request.center_x.raw + offset_real,
@@ -483,14 +565,14 @@ fn build_reference_orbit_at_offset(
 }
 
 fn build_reference_orbit_for_point(
-    c_real_raw: BigInt,
-    c_imag_raw: BigInt,
+    c_real_raw: IBig,
+    c_imag_raw: IBig,
     frac_bits: u32,
     max_iterations: u32,
 ) -> ReferenceOrbit {
-    let mut z_real = BigInt::zero();
-    let mut z_imag = BigInt::zero();
-    let escape_limit = BigInt::from(4_u8) << frac_bits;
+    let mut z_real = IBig::zero();
+    let mut z_imag = IBig::zero();
+    let escape_limit = IBig::from(4_u8) << frac_bits as usize;
 
     let mut orbit_real = Vec::with_capacity(max_iterations as usize + 1);
     let mut orbit_imag = Vec::with_capacity(max_iterations as usize + 1);
@@ -586,8 +668,8 @@ fn mandelbrot_color_f64(cx: f64, cy: f64, max_iterations: u32) -> [u8; 4] {
 fn mandelbrot_color_perturbation(
     request: &RenderRequest,
     reference: &ReferenceOrbit,
-    delta_c_real_raw: &BigInt,
-    delta_c_imag_raw: &BigInt,
+    delta_c_real_raw: &IBig,
+    delta_c_imag_raw: &IBig,
 ) -> Option<[u8; 4]> {
     let delta_c_real = raw_fixed_to_f64(delta_c_real_raw, request.frac_bits);
     let delta_c_imag = raw_fixed_to_f64(delta_c_imag_raw, request.frac_bits);
@@ -698,27 +780,27 @@ fn perturbation_series_seed(
     (best_iteration, best_dz_real, best_dz_imag)
 }
 
-fn pixel_offset_real_raw(request: &RenderRequest, pixel_x: f64) -> BigInt {
+fn pixel_offset_real_raw(request: &RenderRequest, pixel_x: f64) -> IBig {
     let half_width = request.width as f64 * 0.5;
     let dx = BigFixed::from_f64(pixel_x - half_width, request.frac_bits);
     mul_fixed_raw(&request.scale.raw, &dx.raw, request.frac_bits)
 }
 
-fn pixel_offset_imag_raw(request: &RenderRequest, pixel_y: f64) -> BigInt {
+fn pixel_offset_imag_raw(request: &RenderRequest, pixel_y: f64) -> IBig {
     let half_height = request.height as f64 * 0.5;
     let dy = BigFixed::from_f64(pixel_y - half_height, request.frac_bits);
     mul_fixed_raw(&request.scale.raw, &dy.raw, request.frac_bits)
 }
 
 fn mandelbrot_color_fixed(
-    cx: &BigInt,
-    cy: &BigInt,
+    cx: &IBig,
+    cy: &IBig,
     max_iterations: u32,
     frac_bits: u32,
 ) -> [u8; 4] {
-    let mut zx = BigInt::zero();
-    let mut zy = BigInt::zero();
-    let escape_limit = BigInt::from(4_u8) << frac_bits;
+    let mut zx = IBig::zero();
+    let mut zy = IBig::zero();
+    let escape_limit = IBig::from(4_u8) << frac_bits as usize;
     let mut iteration = 0;
 
     while iteration < max_iterations {
@@ -741,7 +823,7 @@ fn mandelbrot_color_fixed(
     [7, 10, 18, 255]
 }
 
-fn raw_fixed_to_f64(raw: &BigInt, frac_bits: u32) -> f64 {
+fn raw_fixed_to_f64(raw: &IBig, frac_bits: u32) -> f64 {
     raw_to_f64(raw, frac_bits)
 }
 
@@ -835,8 +917,8 @@ fn escape_color(iteration: u32, max_iterations: u32, radius: f64) -> [u8; 4] {
     }
 
     let radius = radius.max(1.000_000_1);
-    let smooth = iteration as f64 + 1.0 - radius.ln().ln() / std::f64::consts::LN_2;
-    let t = (smooth / max_iterations as f64).clamp(0.0, 1.0);
+    let smooth_iter = iteration as f64 + 1.0 - radius.ln().ln() / std::f64::consts::LN_2;
+    let t = (smooth_iter / max_iterations as f64).clamp(0.0, 1.0);
 
     let r = (9.0 * (1.0 - t) * t * t * t * 255.0).round() as u8;
     let g = (15.0 * (1.0 - t) * (1.0 - t) * t * t * 255.0).round() as u8;
