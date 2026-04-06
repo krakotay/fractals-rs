@@ -83,11 +83,8 @@ impl FractalApp {
             return;
         };
 
-        let preview = build_preview_frame(
-            &self.displayed_pixels,
-            previous_viewport.as_ref(),
-            viewport,
-        );
+        let preview =
+            build_preview_frame(&self.displayed_pixels, previous_viewport.as_ref(), viewport);
         self.displayed_pixels = preview;
         self.pending_tiles.clear();
         self.displayed_viewport = Some(viewport.clone());
@@ -176,9 +173,8 @@ impl FractalApp {
                     pixels,
                 } => {
                     if generation == self.displayed_generation {
-                        self.pending_tiles.retain(|tile| {
-                            *tile != (x, y, width, height)
-                        });
+                        self.pending_tiles
+                            .retain(|tile| *tile != (x, y, width, height));
                         blit_tile_into_framebuffer(
                             &mut self.displayed_pixels,
                             self.displayed_viewport
@@ -354,7 +350,8 @@ fn blit_tile_into_framebuffer(
     tile_pixels: &[u8],
 ) {
     for row in 0..height as usize {
-        let dst_start = (((y as usize + row) * framebuffer_width as usize + x as usize) * 4) as usize;
+        let dst_start =
+            (((y as usize + row) * framebuffer_width as usize + x as usize) * 4) as usize;
         let src_start = row * width as usize * 4;
         let byte_len = width as usize * 4;
         framebuffer[dst_start..dst_start + byte_len]

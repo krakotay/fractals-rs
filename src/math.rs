@@ -109,31 +109,35 @@ impl BigFixed {
     }
 
     pub fn to_f64(&self) -> f64 {
-        if self.raw.is_zero() {
-            return 0.0;
-        }
-
-        let negative = self.raw.is_negative();
-        let abs = self.raw.abs();
-        let bits = abs.bits() as i64;
-        let mantissa_bits = 53_i64;
-        let shift = (bits - mantissa_bits).max(0);
-        let mantissa = (&abs >> shift as usize).to_u64().unwrap_or(u64::MAX);
-        let exponent = shift - self.frac_bits as i64;
-        let value = if exponent > i32::MAX as i64 {
-            f64::INFINITY
-        } else if exponent < i32::MIN as i64 {
-            0.0
-        } else {
-            (mantissa as f64) * 2_f64.powi(exponent as i32)
-        };
-
-        if negative { -value } else { value }
+        raw_to_f64(&self.raw, self.frac_bits)
     }
 }
 
 pub fn mul_fixed_raw(lhs: &BigInt, rhs: &BigInt, frac_bits: u32) -> BigInt {
     (lhs * rhs) >> frac_bits
+}
+
+pub fn raw_to_f64(raw: &BigInt, frac_bits: u32) -> f64 {
+    if raw.is_zero() {
+        return 0.0;
+    }
+
+    let negative = raw.is_negative();
+    let abs = raw.abs();
+    let bits = abs.bits() as i64;
+    let mantissa_bits = 53_i64;
+    let shift = (bits - mantissa_bits).max(0);
+    let mantissa = (&abs >> shift as usize).to_u64().unwrap_or(u64::MAX);
+    let exponent = shift - frac_bits as i64;
+    let value = if exponent > i32::MAX as i64 {
+        f64::INFINITY
+    } else if exponent < i32::MIN as i64 {
+        0.0
+    } else {
+        (mantissa as f64) * 2_f64.powi(exponent as i32)
+    };
+
+    if negative { -value } else { value }
 }
 
 #[derive(Clone)]

@@ -9,4 +9,8 @@ winit = "0.30.13"
 pollster = "0.4.0"
 num-bigint = "0.4.6"
 num-traits = "0.2.19"
-wgpu = "29.0.1"
+wgpu = { version = "29.0.1", default-features = false, features = ["std", "wgsl", "vulkan"] }
+dashu-int = "0.4.1"
+
+[profile.release]
+panic = "abort"
