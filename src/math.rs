@@ -4,7 +4,7 @@ use winit::dpi::PhysicalPosition;
 
 pub const INITIAL_FRAC_BITS: u32 = 160;
 pub const MIN_FRAC_BITS: u32 = 128;
-pub const MAX_FRAC_BITS: u32 = 16_384;
+const PIXEL_PRECISION_GUARD_BITS: u32 = 96;
 
 #[derive(Clone, Debug)]
 pub struct BigFixed {
@@ -33,7 +33,7 @@ impl BigFixed {
         };
 
         let mut raw = BigInt::from(mantissa);
-        let shift = exponent + frac_bits as i32;
+        let shift = exponent as i64 + frac_bits as i64;
         if shift >= 0 {
             raw <<= shift as usize;
         } else {
@@ -99,6 +99,15 @@ impl BigFixed {
         Some((bits as f64 - self.frac_bits as f64) * std::f64::consts::LOG10_2)
     }
 
+    pub fn abs_log2_estimate(&self) -> Option<f64> {
+        let bits = self.raw.bits();
+        if bits == 0 {
+            return None;
+        }
+
+        Some(bits as f64 - self.frac_bits as f64)
+    }
+
     pub fn to_f64(&self) -> f64 {
         if self.raw.is_zero() {
             return 0.0;
@@ -106,12 +115,18 @@ impl BigFixed {
 
         let negative = self.raw.is_negative();
         let abs = self.raw.abs();
-        let bits = abs.bits() as i32;
-        let mantissa_bits = 53_i32;
+        let bits = abs.bits() as i64;
+        let mantissa_bits = 53_i64;
         let shift = (bits - mantissa_bits).max(0);
         let mantissa = (&abs >> shift as usize).to_u64().unwrap_or(u64::MAX);
-        let exponent = shift - self.frac_bits as i32;
-        let value = (mantissa as f64) * 2_f64.powi(exponent);
+        let exponent = shift - self.frac_bits as i64;
+        let value = if exponent > i32::MAX as i64 {
+            f64::INFINITY
+        } else if exponent < i32::MIN as i64 {
+            0.0
+        } else {
+            (mantissa as f64) * 2_f64.powi(exponent as i32)
+        };
 
         if negative { -value } else { value }
     }
@@ -154,11 +169,7 @@ impl ViewportState {
             return;
         }
 
-        let target_frac_bits = if zoom_factor < 1.0 {
-            (self.frac_bits + 28).min(MAX_FRAC_BITS)
-        } else {
-            self.frac_bits.saturating_sub(10).max(MIN_FRAC_BITS)
-        };
+        let target_frac_bits = self.target_frac_bits_for_scale(zoom_factor);
         self.requantize(target_frac_bits);
 
         let factor = BigFixed::from_f64(zoom_factor, self.frac_bits);
@@ -187,6 +198,20 @@ impl ViewportState {
         self.center_y = self.center_y.sub(&shift_y);
     }
 
+    fn target_frac_bits_for_scale(&self, zoom_factor: f64) -> u32 {
+        let next_scale = self.scale.to_f64().abs() * zoom_factor.abs();
+        let next_log2_scale = if next_scale.is_finite() && next_scale > 0.0 {
+            next_scale.log2()
+        } else {
+            self.scale.abs_log2_estimate().unwrap_or(0.0) + zoom_factor.abs().log2()
+        };
+        let viewport_bits = self.width.max(self.height).max(1).ilog2() + 1;
+        let required =
+            (-next_log2_scale).ceil().max(0.0) as u32 + viewport_bits + PIXEL_PRECISION_GUARD_BITS;
+
+        required.max(MIN_FRAC_BITS)
+    }
+
     pub fn requantize(&mut self, frac_bits: u32) {
         if frac_bits == self.frac_bits {
             return;
@@ -199,10 +224,20 @@ impl ViewportState {
     }
 
     pub fn describe(&self) -> String {
+        let scale_text = if let Some(log10_scale) = self.scale.abs_log10_estimate() {
+            let scale = self.scale.to_f64().abs();
+            if scale.is_finite() && scale > 0.0 {
+                format!("{scale:.3e}")
+            } else {
+                format!("1e{log10_scale:.1}")
+            }
+        } else {
+            "0".to_string()
+        };
+
         format!(
-            "fractals-rs | Mandelbrot | scale {:.3e} | frac {}",
-            self.scale.to_f64().abs(),
-            self.frac_bits
+            "fractals-rs | Mandelbrot | scale {scale_text} | frac {}",
+            self.frac_bits,
         )
     }
 }

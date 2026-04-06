@@ -3,6 +3,7 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
     mpsc::{Receiver, Sender},
 };
+use std::time::{Duration, Instant};
 
 use pollster::block_on;
 use winit::{
@@ -16,11 +17,15 @@ use winit::{
 use crate::{
     gpu::{RenderOutcome, RendererState},
     math::ViewportState,
-    render::{RenderMessage, RenderRequest, build_preview_frame, spawn_render_worker},
+    render::{
+        RenderMessage, RenderRequest, RenderStrategy, build_preview_frame, overlay_tile_grid,
+        render_strategy_for_viewport, spawn_render_worker,
+    },
 };
 
 const INITIAL_WIDTH: u32 = 1280;
 const INITIAL_HEIGHT: u32 = 720;
+const RENDER_IDLE_DELAY: Duration = Duration::from_secs(1);
 
 #[derive(Default)]
 pub struct FractalApp {
@@ -34,11 +39,21 @@ pub struct FractalApp {
     displayed_generation: u64,
     displayed_viewport: Option<ViewportState>,
     displayed_pixels: Vec<u8>,
+    pending_tiles: Vec<(u32, u32, u32, u32)>,
     is_dragging: bool,
     drag_last_cursor: Option<PhysicalPosition<f64>>,
+    pending_render_deadline: Option<Instant>,
 }
 
 impl FractalApp {
+    fn cancel_in_flight_render(&mut self) {
+        let Some(latest_requested_generation) = self.latest_requested_generation.as_ref() else {
+            return;
+        };
+
+        latest_requested_generation.store(self.next_generation, Ordering::Relaxed);
+    }
+
     fn request_render(&mut self) {
         let Some(viewport) = self.viewport.as_ref() else {
             return;
@@ -60,7 +75,7 @@ impl FractalApp {
         }
     }
 
-    fn start_preview_and_render(&mut self, previous_viewport: Option<ViewportState>) {
+    fn update_preview(&mut self, previous_viewport: Option<ViewportState>) {
         let Some(renderer) = self.renderer.as_mut() else {
             return;
         };
@@ -74,10 +89,44 @@ impl FractalApp {
             viewport,
         );
         self.displayed_pixels = preview;
+        self.pending_tiles.clear();
         self.displayed_viewport = Some(viewport.clone());
         self.displayed_generation = self.next_generation;
         renderer.upload_full(viewport.width, viewport.height, &self.displayed_pixels);
         renderer.window.request_redraw();
+    }
+
+    fn start_preview_and_render(&mut self, previous_viewport: Option<ViewportState>) {
+        self.pending_render_deadline = None;
+        self.update_preview(previous_viewport);
+        self.request_render();
+    }
+
+    fn preview_and_schedule_render(&mut self, previous_viewport: Option<ViewportState>) {
+        self.cancel_in_flight_render();
+        self.update_preview(previous_viewport);
+        let render_strategy = self
+            .viewport
+            .as_ref()
+            .map(render_strategy_for_viewport)
+            .unwrap_or(RenderStrategy::FastF64);
+        if matches!(render_strategy, RenderStrategy::Exact) {
+            self.pending_render_deadline = None;
+            self.request_render();
+        } else {
+            self.pending_render_deadline = Some(Instant::now() + RENDER_IDLE_DELAY);
+        }
+    }
+
+    fn maybe_start_scheduled_render(&mut self) {
+        let Some(deadline) = self.pending_render_deadline else {
+            return;
+        };
+        if self.is_dragging || Instant::now() < deadline {
+            return;
+        }
+
+        self.pending_render_deadline = None;
         self.request_render();
     }
 
@@ -92,6 +141,32 @@ impl FractalApp {
         let mut has_updates = false;
         while let Ok(message) = render_rx.try_recv() {
             match message {
+                RenderMessage::Started {
+                    generation,
+                    pending_tiles,
+                } => {
+                    if generation == self.displayed_generation {
+                        self.pending_tiles = pending_tiles;
+                        let width = self
+                            .displayed_viewport
+                            .as_ref()
+                            .map(|viewport| viewport.width)
+                            .unwrap_or_default();
+                        let height = self
+                            .displayed_viewport
+                            .as_ref()
+                            .map(|viewport| viewport.height)
+                            .unwrap_or_default();
+                        overlay_tile_grid(
+                            &mut self.displayed_pixels,
+                            width,
+                            height,
+                            &self.pending_tiles,
+                        );
+                        renderer.upload_full(width, height, &self.displayed_pixels);
+                        has_updates = true;
+                    }
+                }
                 RenderMessage::Tile {
                     generation,
                     x,
@@ -101,6 +176,9 @@ impl FractalApp {
                     pixels,
                 } => {
                     if generation == self.displayed_generation {
+                        self.pending_tiles.retain(|tile| {
+                            *tile != (x, y, width, height)
+                        });
                         blit_tile_into_framebuffer(
                             &mut self.displayed_pixels,
                             self.displayed_viewport
@@ -158,6 +236,8 @@ impl ApplicationHandler for FractalApp {
         self.render_tx = Some(render_tx);
         self.render_rx = Some(render_rx);
         self.latest_requested_generation = Some(latest_requested_generation);
+        self.pending_tiles.clear();
+        self.pending_render_deadline = None;
         self.start_preview_and_render(None);
     }
 
@@ -197,7 +277,7 @@ impl ApplicationHandler for FractalApp {
                             viewport.pan_by_pixels(delta_x, delta_y);
                             renderer.window.set_title(&viewport.describe());
                         }
-                        self.start_preview_and_render(previous_viewport);
+                        self.preview_and_schedule_render(previous_viewport);
                     }
                     self.drag_last_cursor = Some(position);
                 }
@@ -209,12 +289,15 @@ impl ApplicationHandler for FractalApp {
                 ..
             } => match state {
                 ElementState::Pressed => {
+                    self.cancel_in_flight_render();
+                    self.pending_render_deadline = None;
                     self.is_dragging = true;
                     self.drag_last_cursor = self.cursor_position;
                 }
                 ElementState::Released => {
                     self.is_dragging = false;
                     self.drag_last_cursor = None;
+                    self.pending_render_deadline = Some(Instant::now() + RENDER_IDLE_DELAY);
                 }
             },
             WindowEvent::MouseWheel { delta, .. } => {
@@ -233,7 +316,7 @@ impl ApplicationHandler for FractalApp {
                         viewport.zoom_at_cursor(0.85_f64.powf(steps), cursor);
                         renderer.window.set_title(&viewport.describe());
                     }
-                    self.start_preview_and_render(previous_viewport);
+                    self.preview_and_schedule_render(previous_viewport);
                 }
             }
             WindowEvent::RedrawRequested => match renderer.render() {
@@ -244,11 +327,19 @@ impl ApplicationHandler for FractalApp {
         }
     }
 
-    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        self.maybe_start_scheduled_render();
+
         if self.drain_render_messages() {
             if let Some(renderer) = self.renderer.as_ref() {
                 renderer.window.request_redraw();
             }
+        }
+
+        if let Some(deadline) = self.pending_render_deadline {
+            event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
+        } else {
+            event_loop.set_control_flow(ControlFlow::Wait);
         }
     }
 }

@@ -8,16 +8,21 @@ use std::{
 };
 
 use num_bigint::BigInt;
-use num_traits::{ToPrimitive, Zero};
+use num_traits::Zero;
 use rayon::prelude::*;
 
 use crate::math::{BigFixed, ViewportState, mul_fixed_raw};
 
 const TILE_SIZE: u32 = 96;
 const FAST_PATH_SCALE_THRESHOLD: f64 = 1.0e-18;
+const PERTURBATION_SCALE_THRESHOLD: f64 = 1.0e-280;
+const PREVIEW_MAGNIFICATION_LIMIT: f64 = 8.0;
 const PREVIEW_BG: [u8; 4] = [10, 12, 18, 255];
 const PREVIEW_GRID: [u8; 4] = [210, 45, 45, 255];
 const PERTURBATION_GROWTH_LIMIT: f64 = 1.0e6;
+const PERTURBATION_GLITCH_RATIO: f64 = 1.0e-8;
+const PERTURBATION_REBASE_RATIO: f64 = 1.0e8;
+const SERIES_DELTA_RATIO: f64 = 1.0e-3;
 
 #[derive(Clone)]
 pub struct RenderRequest {
@@ -32,6 +37,10 @@ pub struct RenderRequest {
 }
 
 pub enum RenderMessage {
+    Started {
+        generation: u64,
+        pending_tiles: Vec<(u32, u32, u32, u32)>,
+    },
     Tile {
         generation: u64,
         x: u32,
@@ -53,6 +62,18 @@ struct TileRect {
 struct ReferenceOrbit {
     z_real: Vec<f64>,
     z_imag: Vec<f64>,
+    z_norm_sqr: Vec<f64>,
+    series_a_real: Vec<f64>,
+    series_a_imag: Vec<f64>,
+    series_b_real: Vec<f64>,
+    series_b_imag: Vec<f64>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RenderStrategy {
+    FastF64,
+    Perturbation,
+    Exact,
 }
 
 impl RenderRequest {
@@ -99,12 +120,62 @@ pub fn recommended_iterations(scale: &BigFixed) -> u32 {
     (384.0 + extra).round().clamp(384.0, 24_000.0) as u32
 }
 
+fn base_render_strategy_for_scale(scale: &BigFixed) -> RenderStrategy {
+    let scale_f64 = scale.to_f64().abs();
+    if scale_f64.is_finite() && scale_f64 >= FAST_PATH_SCALE_THRESHOLD {
+        RenderStrategy::FastF64
+    } else if scale_f64.is_finite() && scale_f64 >= PERTURBATION_SCALE_THRESHOLD {
+        RenderStrategy::Perturbation
+    } else {
+        RenderStrategy::Exact
+    }
+}
+
+pub fn render_strategy_for_viewport(viewport: &ViewportState) -> RenderStrategy {
+    render_strategy_for_geometry(
+        &viewport.center_x,
+        &viewport.center_y,
+        &viewport.scale,
+        viewport.width,
+        viewport.height,
+    )
+}
+
+fn render_strategy_for_request(request: &RenderRequest) -> RenderStrategy {
+    render_strategy_for_geometry(
+        &request.center_x,
+        &request.center_y,
+        &request.scale,
+        request.width,
+        request.height,
+    )
+}
+
+fn render_strategy_for_geometry(
+    center_x: &BigFixed,
+    center_y: &BigFixed,
+    scale: &BigFixed,
+    width: u32,
+    height: u32,
+) -> RenderStrategy {
+    match base_render_strategy_for_scale(scale) {
+        RenderStrategy::FastF64 if f64_fast_path_is_safe(center_x, center_y, scale, width, height) => {
+            RenderStrategy::FastF64
+        }
+        RenderStrategy::FastF64 => RenderStrategy::Perturbation,
+        strategy => strategy,
+    }
+}
+
 fn render_progressive(
     request: &RenderRequest,
     latest_generation: &AtomicU64,
     result_tx: &Sender<RenderMessage>,
 ) {
-    let reference = if request.scale.to_f64().abs() < FAST_PATH_SCALE_THRESHOLD {
+    let reference = if matches!(
+        render_strategy_for_request(request),
+        RenderStrategy::Perturbation
+    ) {
         Some(Arc::new(build_reference_orbit(request)))
     } else {
         None
@@ -116,6 +187,13 @@ fn render_progressive(
         }
 
         let tiles = tiles_for_phase(request.width, request.height, phase);
+        let _ = result_tx.send(RenderMessage::Started {
+            generation: request.generation,
+            pending_tiles: tiles
+                .iter()
+                .map(|tile| (tile.x, tile.y, tile.width, tile.height))
+                .collect(),
+        });
         tiles
             .into_par_iter()
             .for_each_with(result_tx.clone(), |tx, tile| {
@@ -168,13 +246,13 @@ fn render_tile(
     tile: TileRect,
     reference: Option<&ReferenceOrbit>,
 ) -> Vec<u8> {
-    let scale_f64 = request.scale.to_f64().abs();
-    if scale_f64 >= FAST_PATH_SCALE_THRESHOLD {
-        render_tile_f64(request, tile)
-    } else if let Some(reference) = reference {
-        render_tile_perturbation(request, tile, reference)
-    } else {
-        render_tile_fixed(request, tile)
+    match render_strategy_for_request(request) {
+        RenderStrategy::FastF64 => render_tile_f64(request, tile),
+        RenderStrategy::Perturbation => {
+            let reference = reference.expect("perturbation render requires a reference orbit");
+            render_tile_perturbation(request, tile, reference)
+        }
+        RenderStrategy::Exact => render_tile_fixed(request, tile),
     }
 }
 
@@ -217,6 +295,7 @@ pub fn build_preview_frame(
             && source_viewport.width > 0
             && source_viewport.height > 0
             && source_pixels.len() == (source_viewport.width * source_viewport.height * 4) as usize
+            && preview_reprojection_is_useful(source_viewport, target_viewport)
         {
             let src_center_x = source_viewport.center_x.to_f64();
             let src_center_y = source_viewport.center_y.to_f64();
@@ -224,6 +303,17 @@ pub fn build_preview_frame(
             let dst_center_x = target_viewport.center_x.to_f64();
             let dst_center_y = target_viewport.center_y.to_f64();
             let dst_scale = target_viewport.scale.to_f64();
+            if !src_center_x.is_finite()
+                || !src_center_y.is_finite()
+                || !src_scale.is_finite()
+                || src_scale == 0.0
+                || !dst_center_x.is_finite()
+                || !dst_center_y.is_finite()
+                || !dst_scale.is_finite()
+                || dst_scale == 0.0
+            {
+                return fill_preview_background(pixels);
+            }
             let src_half_width = source_viewport.width as f64 * 0.5;
             let src_half_height = source_viewport.height as f64 * 0.5;
             let dst_half_width = width as f64 * 0.5;
@@ -255,22 +345,31 @@ pub fn build_preview_frame(
         }
     }
 
-    if pixels.iter().all(|value| *value == 0) {
-        for chunk in pixels.chunks_exact_mut(4) {
-            chunk.copy_from_slice(&PREVIEW_BG);
-        }
-    }
-
-    overlay_tile_grid(&mut pixels, width, height);
-    pixels
+    fill_preview_background(pixels)
 }
 
-fn overlay_tile_grid(pixels: &mut [u8], width: u32, height: u32) {
-    for y in 0..height {
-        for x in 0..width {
-            if x % TILE_SIZE == 0 || y % TILE_SIZE == 0 {
+pub fn overlay_tile_grid(
+    pixels: &mut [u8],
+    width: u32,
+    height: u32,
+    tiles: &[(u32, u32, u32, u32)],
+) {
+    for &(tile_x, tile_y, tile_width, tile_height) in tiles {
+        let max_y = (tile_y + tile_height).min(height);
+        let max_x = (tile_x + tile_width).min(width);
+        for y in tile_y..max_y {
+            for x in tile_x..max_x {
+                if ((x - tile_x) / 8 + (y - tile_y) / 8) % 2 != 0 {
+                    continue;
+                }
+
                 let offset = ((y * width + x) * 4) as usize;
-                pixels[offset..offset + 4].copy_from_slice(&PREVIEW_GRID);
+                pixels[offset] = ((pixels[offset] as u16 + PREVIEW_GRID[0] as u16) / 2) as u8;
+                pixels[offset + 1] =
+                    ((pixels[offset + 1] as u16 + PREVIEW_GRID[1] as u16) / 2) as u8;
+                pixels[offset + 2] =
+                    ((pixels[offset + 2] as u16 + PREVIEW_GRID[2] as u16) / 2) as u8;
+                pixels[offset + 3] = 255;
             }
         }
     }
@@ -318,14 +417,54 @@ fn render_tile_perturbation(
     let start_dy = BigFixed::from_f64(tile.y as f64 - half_height, frac_bits);
     let start_offset_real = mul_fixed_raw(&request.scale.raw, &start_dx.raw, frac_bits);
     let mut offset_imag = mul_fixed_raw(&request.scale.raw, &start_dy.raw, frac_bits);
+    let tile_reference_offset_real = pixel_offset_real_raw(
+        request,
+        tile.x as f64 + tile.width as f64 * 0.5 - 0.5,
+    );
+    let tile_reference_offset_imag = pixel_offset_imag_raw(
+        request,
+        tile.y as f64 + tile.height as f64 * 0.5 - 0.5,
+    );
+    let mut tile_reference = None;
 
     for local_y in 0..tile.height as usize {
         let row_offset = local_y * tile.width as usize * 4;
         let mut offset_real = start_offset_real.clone();
 
         for local_x in 0..tile.width as usize {
-            let color =
-                mandelbrot_color_perturbation(request, reference, &offset_real, &offset_imag);
+            let tile_reference = tile_reference.get_or_insert_with(|| {
+                build_reference_orbit_at_offset(
+                    request,
+                    &tile_reference_offset_real,
+                    &tile_reference_offset_imag,
+                )
+            });
+            let rebased_real = &offset_real - &tile_reference_offset_real;
+            let rebased_imag = &offset_imag - &tile_reference_offset_imag;
+            let color = mandelbrot_color_perturbation(
+                request,
+                tile_reference,
+                &rebased_real,
+                &rebased_imag,
+            )
+            .or_else(|| {
+                mandelbrot_color_perturbation(
+                    request,
+                    reference,
+                    &offset_real,
+                    &offset_imag,
+                )
+            })
+            .unwrap_or_else(|| {
+                let c_real = &request.center_x.raw + &offset_real;
+                let c_imag = &request.center_y.raw + &offset_imag;
+                mandelbrot_color_fixed(
+                    &c_real,
+                    &c_imag,
+                    request.max_iterations,
+                    request.frac_bits,
+                )
+            });
             let offset = row_offset + local_x * 4;
             pixels[offset..offset + 4].copy_from_slice(&color);
             offset_real += &request.scale.raw;
@@ -338,26 +477,83 @@ fn render_tile_perturbation(
 }
 
 fn build_reference_orbit(request: &RenderRequest) -> ReferenceOrbit {
-    let frac_bits = request.frac_bits;
+    build_reference_orbit_for_point(
+        request.center_x.raw.clone(),
+        request.center_y.raw.clone(),
+        request.frac_bits,
+        request.max_iterations,
+    )
+}
+
+fn build_reference_orbit_at_offset(
+    request: &RenderRequest,
+    offset_real: &BigInt,
+    offset_imag: &BigInt,
+) -> ReferenceOrbit {
+    build_reference_orbit_for_point(
+        &request.center_x.raw + offset_real,
+        &request.center_y.raw + offset_imag,
+        request.frac_bits,
+        request.max_iterations,
+    )
+}
+
+fn build_reference_orbit_for_point(
+    c_real_raw: BigInt,
+    c_imag_raw: BigInt,
+    frac_bits: u32,
+    max_iterations: u32,
+) -> ReferenceOrbit {
     let mut z_real = BigInt::zero();
     let mut z_imag = BigInt::zero();
     let escape_limit = BigInt::from(4_u8) << frac_bits;
 
-    let mut orbit_real = Vec::with_capacity(request.max_iterations as usize + 1);
-    let mut orbit_imag = Vec::with_capacity(request.max_iterations as usize + 1);
+    let mut orbit_real = Vec::with_capacity(max_iterations as usize + 1);
+    let mut orbit_imag = Vec::with_capacity(max_iterations as usize + 1);
+    let mut orbit_norm_sqr = Vec::with_capacity(max_iterations as usize + 1);
+    let mut series_a_real = Vec::with_capacity(max_iterations as usize + 1);
+    let mut series_a_imag = Vec::with_capacity(max_iterations as usize + 1);
+    let mut series_b_real = Vec::with_capacity(max_iterations as usize + 1);
+    let mut series_b_imag = Vec::with_capacity(max_iterations as usize + 1);
     orbit_real.push(0.0);
     orbit_imag.push(0.0);
+    orbit_norm_sqr.push(0.0);
+    series_a_real.push(0.0);
+    series_a_imag.push(0.0);
+    series_b_real.push(0.0);
+    series_b_imag.push(0.0);
 
-    for _ in 0..request.max_iterations {
+    for _ in 0..max_iterations {
+        let current_real = *orbit_real.last().unwrap_or(&0.0);
+        let current_imag = *orbit_imag.last().unwrap_or(&0.0);
         let zr2 = mul_fixed_raw(&z_real, &z_real, frac_bits);
         let zi2 = mul_fixed_raw(&z_imag, &z_imag, frac_bits);
         let zri = mul_fixed_raw(&z_real, &z_imag, frac_bits);
 
-        let next_real = zr2 - zi2 + &request.center_x.raw;
-        let next_imag = (&zri << 1) + &request.center_y.raw;
+        let next_real = zr2 - zi2 + &c_real_raw;
+        let next_imag = (&zri << 1) + &c_imag_raw;
+        let next_real_f64 = raw_fixed_to_f64(&next_real, frac_bits);
+        let next_imag_f64 = raw_fixed_to_f64(&next_imag, frac_bits);
+        let next_norm_sqr = next_real_f64 * next_real_f64 + next_imag_f64 * next_imag_f64;
 
-        orbit_real.push(raw_fixed_to_f64(&next_real, frac_bits));
-        orbit_imag.push(raw_fixed_to_f64(&next_imag, frac_bits));
+        orbit_real.push(next_real_f64);
+        orbit_imag.push(next_imag_f64);
+        orbit_norm_sqr.push(next_norm_sqr);
+
+        let current_a_real = *series_a_real.last().unwrap_or(&0.0);
+        let current_a_imag = *series_a_imag.last().unwrap_or(&0.0);
+        let current_b_real = *series_b_real.last().unwrap_or(&0.0);
+        let current_b_imag = *series_b_imag.last().unwrap_or(&0.0);
+        let (z_times_a_real, z_times_a_imag) =
+            complex_mul(current_real, current_imag, current_a_real, current_a_imag);
+        let (a_sq_real, a_sq_imag) =
+            complex_mul(current_a_real, current_a_imag, current_a_real, current_a_imag);
+        let (z_times_b_real, z_times_b_imag) =
+            complex_mul(current_real, current_imag, current_b_real, current_b_imag);
+        series_a_real.push(2.0 * z_times_a_real + 1.0);
+        series_a_imag.push(2.0 * z_times_a_imag);
+        series_b_real.push(2.0 * z_times_b_real + a_sq_real);
+        series_b_imag.push(2.0 * z_times_b_imag + a_sq_imag);
 
         let magnitude = mul_fixed_raw(&next_real, &next_real, frac_bits)
             + mul_fixed_raw(&next_imag, &next_imag, frac_bits);
@@ -373,6 +569,11 @@ fn build_reference_orbit(request: &RenderRequest) -> ReferenceOrbit {
     ReferenceOrbit {
         z_real: orbit_real,
         z_imag: orbit_imag,
+        z_norm_sqr: orbit_norm_sqr,
+        series_a_real,
+        series_a_imag,
+        series_b_real,
+        series_b_imag,
     }
 }
 
@@ -399,31 +600,22 @@ fn mandelbrot_color_perturbation(
     reference: &ReferenceOrbit,
     delta_c_real_raw: &BigInt,
     delta_c_imag_raw: &BigInt,
-) -> [u8; 4] {
+) -> Option<[u8; 4]> {
     let delta_c_real = raw_fixed_to_f64(delta_c_real_raw, request.frac_bits);
     let delta_c_imag = raw_fixed_to_f64(delta_c_imag_raw, request.frac_bits);
 
     if (delta_c_real == 0.0 && !delta_c_real_raw.is_zero())
         || (delta_c_imag == 0.0 && !delta_c_imag_raw.is_zero())
     {
-        let c_real = &request.center_x.raw + delta_c_real_raw;
-        let c_imag = &request.center_y.raw + delta_c_imag_raw;
-        return mandelbrot_color_fixed(&c_real, &c_imag, request.max_iterations, request.frac_bits);
+        return None;
     }
 
-    let mut dz_real = 0.0_f64;
-    let mut dz_imag = 0.0_f64;
+    let (start_iteration, mut dz_real, mut dz_imag) =
+        perturbation_series_seed(reference, delta_c_real, delta_c_imag);
 
-    for iteration in 0..request.max_iterations as usize {
+    for iteration in start_iteration..request.max_iterations as usize {
         if iteration >= reference.z_real.len() {
-            let c_real = &request.center_x.raw + delta_c_real_raw;
-            let c_imag = &request.center_y.raw + delta_c_imag_raw;
-            return mandelbrot_color_fixed(
-                &c_real,
-                &c_imag,
-                request.max_iterations,
-                request.frac_bits,
-            );
+            return None;
         }
 
         let zr = reference.z_real[iteration];
@@ -432,7 +624,21 @@ fn mandelbrot_color_perturbation(
         let imag = zi + dz_imag;
         let magnitude = real * real + imag * imag;
         if magnitude > 4.0 {
-            return escape_color(iteration as u32, request.max_iterations, magnitude.sqrt());
+            return Some(escape_color(
+                iteration as u32,
+                request.max_iterations,
+                magnitude.sqrt(),
+            ));
+        }
+
+        let reference_norm_sqr = reference.z_norm_sqr[iteration];
+        let delta_norm_sqr = dz_real * dz_real + dz_imag * dz_imag;
+        if iteration > 0
+            && reference_norm_sqr > 0.0
+            && (magnitude < reference_norm_sqr * PERTURBATION_GLITCH_RATIO
+                || delta_norm_sqr > reference_norm_sqr * PERTURBATION_REBASE_RATIO)
+        {
+            return None;
         }
 
         let next_dz_real = 2.0 * (zr * dz_real - zi * dz_imag)
@@ -446,21 +652,75 @@ fn mandelbrot_color_perturbation(
             || !next_dz_imag.is_finite()
             || next_dz_real.abs().max(next_dz_imag.abs()) > PERTURBATION_GROWTH_LIMIT
         {
-            let c_real = &request.center_x.raw + delta_c_real_raw;
-            let c_imag = &request.center_y.raw + delta_c_imag_raw;
-            return mandelbrot_color_fixed(
-                &c_real,
-                &c_imag,
-                request.max_iterations,
-                request.frac_bits,
-            );
+            return None;
         }
 
         dz_real = next_dz_real;
         dz_imag = next_dz_imag;
     }
 
-    [7, 10, 18, 255]
+    Some([7, 10, 18, 255])
+}
+
+fn perturbation_series_seed(
+    reference: &ReferenceOrbit,
+    delta_c_real: f64,
+    delta_c_imag: f64,
+) -> (usize, f64, f64) {
+    let delta_norm_sqr = delta_c_real * delta_c_real + delta_c_imag * delta_c_imag;
+    if delta_norm_sqr == 0.0 {
+        return (0, 0.0, 0.0);
+    }
+
+    let (dc_sq_real, dc_sq_imag) =
+        complex_mul(delta_c_real, delta_c_imag, delta_c_real, delta_c_imag);
+    let mut best_iteration = 0;
+    let mut best_dz_real = 0.0;
+    let mut best_dz_imag = 0.0;
+
+    for iteration in 1..reference.z_real.len() {
+        let (a_dc_real, a_dc_imag) = complex_mul(
+            reference.series_a_real[iteration],
+            reference.series_a_imag[iteration],
+            delta_c_real,
+            delta_c_imag,
+        );
+        let (b_dc2_real, b_dc2_imag) = complex_mul(
+            reference.series_b_real[iteration],
+            reference.series_b_imag[iteration],
+            dc_sq_real,
+            dc_sq_imag,
+        );
+        let dz_real = a_dc_real + b_dc2_real;
+        let dz_imag = a_dc_imag + b_dc2_imag;
+        let dz_norm_sqr = dz_real * dz_real + dz_imag * dz_imag;
+        let reference_norm_sqr = reference.z_norm_sqr[iteration];
+
+        if !dz_real.is_finite()
+            || !dz_imag.is_finite()
+            || (reference_norm_sqr > 0.0 && dz_norm_sqr > reference_norm_sqr * SERIES_DELTA_RATIO)
+        {
+            break;
+        }
+
+        best_iteration = iteration;
+        best_dz_real = dz_real;
+        best_dz_imag = dz_imag;
+    }
+
+    (best_iteration, best_dz_real, best_dz_imag)
+}
+
+fn pixel_offset_real_raw(request: &RenderRequest, pixel_x: f64) -> BigInt {
+    let half_width = request.width as f64 * 0.5;
+    let dx = BigFixed::from_f64(pixel_x - half_width, request.frac_bits);
+    mul_fixed_raw(&request.scale.raw, &dx.raw, request.frac_bits)
+}
+
+fn pixel_offset_imag_raw(request: &RenderRequest, pixel_y: f64) -> BigInt {
+    let half_height = request.height as f64 * 0.5;
+    let dy = BigFixed::from_f64(pixel_y - half_height, request.frac_bits);
+    mul_fixed_raw(&request.scale.raw, &dy.raw, request.frac_bits)
 }
 
 fn mandelbrot_color_fixed(
@@ -479,8 +739,7 @@ fn mandelbrot_color_fixed(
         let zy2 = mul_fixed_raw(&zy, &zy, frac_bits);
         let magnitude = &zx2 + &zy2;
         if magnitude > escape_limit {
-            let radius =
-                magnitude.to_f64().unwrap_or(f64::INFINITY) * 2_f64.powi(-(frac_bits as i32));
+            let radius = raw_fixed_to_f64(&magnitude, frac_bits);
             return escape_color(iteration, max_iterations, radius.sqrt());
         }
 
@@ -503,6 +762,90 @@ fn raw_fixed_to_f64(raw: &BigInt, frac_bits: u32) -> f64 {
     .to_f64()
 }
 
+fn complex_mul(a_real: f64, a_imag: f64, b_real: f64, b_imag: f64) -> (f64, f64) {
+    (
+        a_real * b_real - a_imag * b_imag,
+        a_real * b_imag + a_imag * b_real,
+    )
+}
+
+fn fill_preview_background(mut pixels: Vec<u8>) -> Vec<u8> {
+    if pixels.iter().all(|value| *value == 0) {
+        for chunk in pixels.chunks_exact_mut(4) {
+            chunk.copy_from_slice(&PREVIEW_BG);
+        }
+    }
+
+    pixels
+}
+
+fn preview_reprojection_is_useful(
+    source_viewport: &ViewportState,
+    target_viewport: &ViewportState,
+) -> bool {
+    if matches!(
+        render_strategy_for_viewport(source_viewport),
+        RenderStrategy::Exact
+    ) || matches!(
+        render_strategy_for_viewport(target_viewport),
+        RenderStrategy::Exact
+    ) {
+        return false;
+    }
+
+    let src_scale = source_viewport.scale.to_f64().abs();
+    let dst_scale = target_viewport.scale.to_f64().abs();
+    if !src_scale.is_finite() || !dst_scale.is_finite() || src_scale == 0.0 || dst_scale == 0.0 {
+        return false;
+    }
+
+    (src_scale / dst_scale).max(dst_scale / src_scale) <= PREVIEW_MAGNIFICATION_LIMIT
+}
+
+fn f64_fast_path_is_safe(
+    center_x: &BigFixed,
+    center_y: &BigFixed,
+    scale: &BigFixed,
+    width: u32,
+    height: u32,
+) -> bool {
+    let scale_f64 = scale.to_f64().abs();
+    if !scale_f64.is_finite() || scale_f64 == 0.0 {
+        return false;
+    }
+
+    let span_x = width.max(2);
+    let span_y = height.max(2);
+    f64_axis_has_pixel_resolution(center_x, scale_f64, span_x)
+        && f64_axis_has_pixel_resolution(center_y, scale_f64, span_y)
+}
+
+fn f64_axis_has_pixel_resolution(center: &BigFixed, scale_f64: f64, span_pixels: u32) -> bool {
+    let center_f64 = center.to_f64();
+    if !center_f64.is_finite() {
+        return false;
+    }
+
+    let half_span = span_pixels as f64 * 0.5;
+    let edge_magnitude = center_f64.abs() + scale_f64 * half_span;
+    let ulp = f64_ulp(edge_magnitude.max(center_f64.abs()));
+    scale_f64 > ulp * 4.0
+}
+
+fn f64_ulp(value: f64) -> f64 {
+    let value = value.abs();
+    if !value.is_finite() {
+        return f64::INFINITY;
+    }
+    if value == 0.0 {
+        return f64::from_bits(1);
+    }
+
+    let bits = value.to_bits();
+    let next = f64::from_bits(bits + 1);
+    next - value
+}
+
 fn escape_color(iteration: u32, max_iterations: u32, radius: f64) -> [u8; 4] {
     if iteration >= max_iterations {
         return [7, 10, 18, 255];
@@ -516,4 +859,42 @@ fn escape_color(iteration: u32, max_iterations: u32, radius: f64) -> [u8; 4] {
     let g = (15.0 * (1.0 - t) * (1.0 - t) * t * t * 255.0).round() as u8;
     let b = (8.5 * (1.0 - t) * (1.0 - t) * (1.0 - t) * t * 255.0).round() as u8;
     [r, g, b, 255]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{RenderStrategy, f64_axis_has_pixel_resolution, render_strategy_for_viewport};
+    use crate::math::{BigFixed, INITIAL_FRAC_BITS, ViewportState};
+
+    #[test]
+    fn moderate_zoom_keeps_f64_fast_path() {
+        let viewport = ViewportState::new(1280, 720);
+        assert_eq!(render_strategy_for_viewport(&viewport), RenderStrategy::FastF64);
+    }
+
+    #[test]
+    fn deep_zoom_near_half_disables_f64_fast_path() {
+        let frac_bits = INITIAL_FRAC_BITS;
+        let viewport = ViewportState {
+            width: 1280,
+            height: 720,
+            frac_bits,
+            center_x: BigFixed::from_f64(-0.5, frac_bits),
+            center_y: BigFixed::from_f64(0.0, frac_bits),
+            scale: BigFixed::from_f64(4.708e-18, frac_bits),
+        };
+
+        assert_eq!(
+            render_strategy_for_viewport(&viewport),
+            RenderStrategy::Perturbation
+        );
+    }
+
+    #[test]
+    fn f64_resolution_test_catches_collapsed_adjacent_pixels() {
+        let frac_bits = INITIAL_FRAC_BITS;
+        let center = BigFixed::from_f64(-0.5, frac_bits);
+        assert!(!f64_axis_has_pixel_resolution(&center, 4.708e-18, 1280));
+        assert!(f64_axis_has_pixel_resolution(&center, 1.0e-12, 1280));
+    }
 }
