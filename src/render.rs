@@ -395,8 +395,8 @@ fn cpu_reference_for_strategy<'a>(
         return None;
     }
 
-    let reference = reference.get_or_insert_with(|| Arc::new(build_reference_orbit(request)));
-    Some(reference.as_ref())
+    reference.get_or_insert_with(|| Arc::new(build_reference_orbit(request)));
+    reference.as_deref()
 }
 
 fn center_out_tiles(width: u32, height: u32, tile_size: u32) -> Vec<TileRect> {
