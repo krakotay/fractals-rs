@@ -19,7 +19,7 @@ use crate::{
     math::ViewportState,
     render::{
         RenderMessage, RenderRequest, RenderStrategy, build_preview_frame, overlay_tile_grid,
-        render_strategy_for_viewport, spawn_render_worker,
+        preview_reprojection_is_useful, render_strategy_for_viewport, spawn_render_worker,
     },
 };
 
@@ -39,6 +39,8 @@ pub struct FractalApp {
     displayed_generation: u64,
     displayed_viewport: Option<ViewportState>,
     displayed_pixels: Vec<u8>,
+    rendered_viewport: Option<ViewportState>,
+    rendered_pixels: Vec<u8>,
     pending_tiles: Vec<(u32, u32, u32, u32)>,
     render_in_flight: bool,
     is_dragging: bool,
@@ -85,8 +87,16 @@ impl FractalApp {
             return;
         };
 
-        let preview =
-            build_preview_frame(&self.displayed_pixels, previous_viewport.as_ref(), viewport);
+        let source_viewport = self
+            .rendered_viewport
+            .as_ref()
+            .filter(|source| preview_source_is_useful(&self.rendered_pixels, source, viewport));
+        let (source_pixels, source_viewport) = if let Some(source_viewport) = source_viewport {
+            (&self.rendered_pixels, Some(source_viewport))
+        } else {
+            (&self.displayed_pixels, previous_viewport.as_ref())
+        };
+        let preview = build_preview_frame(source_pixels, source_viewport, viewport);
         self.displayed_pixels = preview;
         self.pending_tiles.clear();
         self.displayed_viewport = Some(viewport.clone());
@@ -156,6 +166,8 @@ impl FractalApp {
                         self.pending_tiles.clear();
                         self.render_in_flight = false;
                         self.displayed_pixels = pixels;
+                        self.rendered_pixels = self.displayed_pixels.clone();
+                        self.rendered_viewport = self.displayed_viewport.clone();
                         renderer.upload_full(width, height, &self.displayed_pixels);
                         has_updates = true;
                     }
@@ -166,6 +178,8 @@ impl FractalApp {
                     {
                         self.pending_tiles.clear();
                         self.render_in_flight = false;
+                        self.rendered_pixels = self.displayed_pixels.clone();
+                        self.rendered_viewport = self.displayed_viewport.clone();
                         has_updates = true;
                     }
                 }
@@ -376,6 +390,18 @@ impl ApplicationHandler for FractalApp {
             event_loop.set_control_flow(ControlFlow::Wait);
         }
     }
+}
+
+fn preview_source_is_useful(
+    source_pixels: &[u8],
+    source_viewport: &ViewportState,
+    target_viewport: &ViewportState,
+) -> bool {
+    !source_pixels.is_empty()
+        && source_viewport.width > 0
+        && source_viewport.height > 0
+        && source_pixels.len() == (source_viewport.width * source_viewport.height * 4) as usize
+        && preview_reprojection_is_useful(source_viewport, target_viewport)
 }
 
 fn blit_tile_into_framebuffer(

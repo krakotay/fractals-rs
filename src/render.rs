@@ -1095,7 +1095,7 @@ fn fill_preview_background(mut pixels: Vec<u8>) -> Vec<u8> {
     pixels
 }
 
-fn preview_reprojection_is_useful(
+pub(crate) fn preview_reprojection_is_useful(
     source_viewport: &ViewportState,
     target_viewport: &ViewportState,
 ) -> bool {
