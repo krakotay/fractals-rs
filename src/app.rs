@@ -19,7 +19,7 @@ use crate::{
     math::ViewportState,
     render::{
         RenderMessage, RenderRequest, RenderStrategy, build_preview_frame, overlay_tile_grid,
-        patch_exact_pixels, prepare_gpu_render, render_strategy_for_viewport, spawn_render_worker,
+        render_strategy_for_viewport, spawn_render_worker,
     },
 };
 
@@ -40,6 +40,7 @@ pub struct FractalApp {
     displayed_viewport: Option<ViewportState>,
     displayed_pixels: Vec<u8>,
     pending_tiles: Vec<(u32, u32, u32, u32)>,
+    render_in_flight: bool,
     is_dragging: bool,
     drag_last_cursor: Option<PhysicalPosition<f64>>,
     pending_render_deadline: Option<Instant>,
@@ -52,52 +53,27 @@ impl FractalApp {
         };
 
         latest_requested_generation.store(self.next_generation, Ordering::Relaxed);
+        self.render_in_flight = false;
     }
 
     fn request_render(&mut self) {
+        let Some(latest_requested_generation) = self.latest_requested_generation.as_ref() else {
+            return;
+        };
         let Some(viewport) = self.viewport.as_ref() else {
             return;
         };
-        let Some(latest_requested_generation) = self.latest_requested_generation.as_ref() else {
+        let Some(render_tx) = self.render_tx.as_ref() else {
             return;
         };
 
         let generation = self.next_generation;
         let request = RenderRequest::from_viewport(viewport, generation);
-        let viewport_snapshot = viewport.clone();
         latest_requested_generation.store(generation, Ordering::Relaxed);
-
-        if let Some(renderer) = self.renderer.as_mut() {
-            if renderer.supports_fractal_compute() {
-                if let Some(gpu_params) = prepare_gpu_render(&request) {
-                    if let Some(mut output) = renderer.render_fractal_to_pixels(&gpu_params) {
-                        if output.fallback_mask.iter().any(|flag| *flag != 0) {
-                            patch_exact_pixels(&request, &mut output.pixels, &output.fallback_mask);
-                        }
-
-                        self.pending_tiles.clear();
-                        self.displayed_viewport = Some(viewport_snapshot.clone());
-                        self.displayed_generation = generation;
-                        self.displayed_pixels = output.pixels;
-                        renderer.upload_full(
-                            viewport_snapshot.width,
-                            viewport_snapshot.height,
-                            &self.displayed_pixels,
-                        );
-                        renderer.window.request_redraw();
-                        self.next_generation += 1;
-                        return;
-                    }
-                }
-            }
-        }
-
-        let Some(render_tx) = self.render_tx.as_ref() else {
-            return;
-        };
 
         if render_tx.send(request).is_ok() {
             self.next_generation += 1;
+            self.render_in_flight = true;
         }
     }
 
@@ -157,6 +133,10 @@ impl FractalApp {
         let Some(render_rx) = self.render_rx.as_ref() else {
             return false;
         };
+        let latest_requested_generation = self
+            .latest_requested_generation
+            .as_ref()
+            .map(|latest| latest.load(Ordering::Relaxed));
         let Some(renderer) = self.renderer.as_mut() else {
             return false;
         };
@@ -164,11 +144,38 @@ impl FractalApp {
         let mut has_updates = false;
         while let Ok(message) = render_rx.try_recv() {
             match message {
+                RenderMessage::FullFrame {
+                    generation,
+                    width,
+                    height,
+                    pixels,
+                } => {
+                    if generation == self.displayed_generation
+                        && latest_requested_generation == Some(generation)
+                    {
+                        self.pending_tiles.clear();
+                        self.render_in_flight = false;
+                        self.displayed_pixels = pixels;
+                        renderer.upload_full(width, height, &self.displayed_pixels);
+                        has_updates = true;
+                    }
+                }
+                RenderMessage::Finished { generation } => {
+                    if generation == self.displayed_generation
+                        && latest_requested_generation == Some(generation)
+                    {
+                        self.pending_tiles.clear();
+                        self.render_in_flight = false;
+                        has_updates = true;
+                    }
+                }
                 RenderMessage::Started {
                     generation,
                     pending_tiles,
                 } => {
-                    if generation == self.displayed_generation {
+                    if generation == self.displayed_generation
+                        && latest_requested_generation == Some(generation)
+                    {
                         self.pending_tiles = pending_tiles;
                         let width = self
                             .displayed_viewport
@@ -198,7 +205,9 @@ impl FractalApp {
                     height,
                     pixels,
                 } => {
-                    if generation == self.displayed_generation {
+                    if generation == self.displayed_generation
+                        && latest_requested_generation == Some(generation)
+                    {
                         self.pending_tiles
                             .retain(|tile| *tile != (x, y, width, height));
                         blit_tile_into_framebuffer(
@@ -259,6 +268,7 @@ impl ApplicationHandler for FractalApp {
         self.render_rx = Some(render_rx);
         self.latest_requested_generation = Some(latest_requested_generation);
         self.pending_tiles.clear();
+        self.render_in_flight = false;
         self.pending_render_deadline = None;
         self.start_preview_and_render(None);
     }
@@ -358,7 +368,9 @@ impl ApplicationHandler for FractalApp {
             }
         }
 
-        if let Some(deadline) = self.pending_render_deadline {
+        if self.render_in_flight {
+            event_loop.set_control_flow(ControlFlow::Poll);
+        } else if let Some(deadline) = self.pending_render_deadline {
             event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
         } else {
             event_loop.set_control_flow(ControlFlow::Wait);

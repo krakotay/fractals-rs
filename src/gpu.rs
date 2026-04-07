@@ -1,8 +1,11 @@
-use std::{borrow::Cow, sync::{Arc, mpsc}};
+use std::{
+    borrow::Cow,
+    sync::{Arc, mpsc},
+};
 
 use winit::{dpi::PhysicalSize, window::Window};
 
-use crate::render::GpuRenderParams;
+use crate::render::{GpuPerturbationJob, GpuReferenceOrbit, GpuRenderParams};
 
 const PRESENT_SHADER: &str = r#"
 @group(0) @binding(0)
@@ -198,10 +201,10 @@ fn perturbation_seed(delta_c_real: f64, delta_c_imag: f64) -> Seed {
 }
 
 fn render_perturbation(pixel_x: u32, pixel_y: u32) -> u32 {
-    let half_width = f64(params.width) * 0.5;
-    let half_height = f64(params.height) * 0.5;
-    let delta_c_real = (f64(pixel_x) - half_width) * params.scale;
-    let delta_c_imag = (f64(pixel_y) - half_height) * params.scale;
+    let tile_center_x = f64(params.width) * 0.5 - 0.5;
+    let tile_center_y = f64(params.height) * 0.5 - 0.5;
+    let delta_c_real = (f64(pixel_x) - tile_center_x) * params.scale;
+    let delta_c_imag = (f64(pixel_y) - tile_center_y) * params.scale;
     let seed = perturbation_seed(delta_c_real, delta_c_imag);
     var dz_real: f64 = seed.dz_real;
     var dz_imag: f64 = seed.dz_imag;
@@ -278,6 +281,7 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
 const WORKGROUP_SIZE: u32 = 8;
 const GPU_RENDER_STRATEGY_FAST_F64: u32 = 0;
+const GPU_RENDER_STRATEGY_PERTURBATION: u32 = 1;
 
 pub struct RendererState {
     pub surface: wgpu::Surface<'static>,
@@ -292,18 +296,45 @@ pub struct RendererState {
     texture: wgpu::Texture,
     texture_view: wgpu::TextureView,
     texture_size: PhysicalSize<u32>,
-    fractal_compute: Option<FractalComputeState>,
 }
 
 struct FractalComputeState {
     pipeline: wgpu::ComputePipeline,
     bind_group_layout: wgpu::BindGroupLayout,
-    dummy_buffer: wgpu::Buffer,
+}
+
+struct FractalComputeSession {
+    state: FractalComputeState,
+    scratch: ComputeScratch,
+}
+
+struct ComputeScratch {
+    params_buffer: wgpu::Buffer,
+    output_buffer: wgpu::Buffer,
+    fallback_buffer: wgpu::Buffer,
+    readback_pixels: wgpu::Buffer,
+    readback_fallback: wgpu::Buffer,
+    orbit_z_real: wgpu::Buffer,
+    orbit_z_imag: wgpu::Buffer,
+    orbit_z_norm_sqr: wgpu::Buffer,
+    orbit_series_a_real: wgpu::Buffer,
+    orbit_series_a_imag: wgpu::Buffer,
+    orbit_series_b_real: wgpu::Buffer,
+    orbit_series_b_imag: wgpu::Buffer,
+    bind_group: wgpu::BindGroup,
+    pixel_byte_capacity: u64,
+    orbit_byte_capacity: u64,
 }
 
 pub struct GpuRenderOutput {
     pub pixels: Vec<u8>,
     pub fallback_mask: Vec<u8>,
+}
+
+pub(crate) struct HeadlessComputeRenderer {
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+    compute: FractalComputeSession,
 }
 
 impl RendererState {
@@ -444,12 +475,6 @@ impl RendererState {
             cache: None,
         });
 
-        let fractal_compute = if requested_features.contains(wgpu::Features::SHADER_F64) {
-            Some(FractalComputeState::new(&device))
-        } else {
-            None
-        };
-
         Self {
             surface,
             device,
@@ -463,17 +488,7 @@ impl RendererState {
             texture,
             texture_view,
             texture_size: size,
-            fractal_compute,
         }
-    }
-
-    pub fn supports_fractal_compute(&self) -> bool {
-        self.fractal_compute.is_some()
-    }
-
-    pub fn render_fractal_to_pixels(&self, params: &GpuRenderParams) -> Option<GpuRenderOutput> {
-        let compute = self.fractal_compute.as_ref()?;
-        compute.render(&self.device, &self.queue, params)
     }
 
     pub fn resize(&mut self, new_size: PhysicalSize<u32>) {
@@ -606,6 +621,73 @@ impl RendererState {
     }
 }
 
+impl HeadlessComputeRenderer {
+    pub(crate) async fn new() -> Option<Self> {
+        let instance = wgpu::Instance::default();
+        let adapter = instance
+            .request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::HighPerformance,
+                compatible_surface: None,
+                force_fallback_adapter: false,
+            })
+            .await
+            .ok()?;
+
+        let supported_features = adapter.features();
+        if !supported_features.contains(wgpu::Features::SHADER_F64) {
+            return None;
+        }
+
+        let required_limits = wgpu::Limits {
+            max_storage_buffers_per_shader_stage: 9,
+            ..wgpu::Limits::default()
+        };
+
+        let (device, queue) = adapter
+            .request_device(&wgpu::DeviceDescriptor {
+                label: Some("fractals-rs headless compute device"),
+                required_features: wgpu::Features::SHADER_F64,
+                required_limits,
+                experimental_features: wgpu::ExperimentalFeatures::disabled(),
+                memory_hints: wgpu::MemoryHints::Performance,
+                trace: wgpu::Trace::Off,
+            })
+            .await
+            .ok()?;
+
+        let compute = FractalComputeSession::new(&device);
+        Some(Self {
+            device,
+            queue,
+            compute,
+        })
+    }
+
+    pub(crate) fn render_fractal_to_pixels(
+        &mut self,
+        params: &GpuRenderParams,
+    ) -> Option<GpuRenderOutput> {
+        self.compute.render(&self.device, &self.queue, params)
+    }
+}
+
+impl FractalComputeSession {
+    fn new(device: &wgpu::Device) -> Self {
+        let state = FractalComputeState::new(device);
+        let scratch = ComputeScratch::new(device, &state.bind_group_layout);
+        Self { state, scratch }
+    }
+
+    fn render(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        params: &GpuRenderParams,
+    ) -> Option<GpuRenderOutput> {
+        self.state.render(device, queue, &mut self.scratch, params)
+    }
+}
+
 impl FractalComputeState {
     fn new(device: &wgpu::Device) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -734,12 +816,9 @@ impl FractalComputeState {
             cache: None,
         });
 
-        let dummy_buffer = create_storage_buffer(device, 8, Some("fractal dummy storage"));
-
         Self {
             pipeline,
             bind_group_layout,
-            dummy_buffer,
         }
     }
 
@@ -747,60 +826,77 @@ impl FractalComputeState {
         &self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
+        scratch: &mut ComputeScratch,
         params: &GpuRenderParams,
     ) -> Option<GpuRenderOutput> {
-        let GpuRenderParams::FastF64 {
-            width,
-            height,
-            center_x,
-            center_y,
-            scale,
-            max_iterations,
-        } = params;
-
-        let pixel_count = *width as u64 * *height as u64;
-        let byte_len = pixel_count * 4;
-        let params_buffer = create_buffer_with_data(
-            device,
-            queue,
-            &encode_gpu_params(
+        match params {
+            GpuRenderParams::FastF64 {
+                width,
+                height,
+                center_x,
+                center_y,
+                scale,
+                max_iterations,
+            } => self.render_job(
+                device,
+                queue,
+                scratch,
                 *width,
                 *height,
                 *max_iterations,
                 GPU_RENDER_STRATEGY_FAST_F64,
-                0,
                 *center_x,
                 *center_y,
                 *scale,
+                None,
             ),
-            wgpu::BufferUsages::UNIFORM,
-            Some("fractal compute params"),
-        );
-        let output_buffer =
-            create_storage_buffer(device, byte_len.max(4), Some("fractal compute pixels"));
-        let fallback_buffer =
-            create_storage_buffer(device, byte_len.max(4), Some("fractal compute fallback"));
-        let readback_pixels = create_readback_buffer(device, byte_len.max(4), "fractal pixels readback");
-        let readback_fallback =
-            create_readback_buffer(device, byte_len.max(4), "fractal fallback readback");
+            GpuRenderParams::Perturbation(job) => {
+                self.render_perturbation_job(device, queue, scratch, job)
+            }
+        }
+    }
 
-        let orbit_buffers = create_orbit_buffers(device, queue, None, &self.dummy_buffer);
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("fractal compute bind group"),
-            layout: &self.bind_group_layout,
-            entries: &[
-                binding_entire_buffer(0, &params_buffer),
-                binding_entire_buffer(1, &output_buffer),
-                binding_entire_buffer(2, &fallback_buffer),
-                binding_entire_buffer(3, &orbit_buffers.z_real),
-                binding_entire_buffer(4, &orbit_buffers.z_imag),
-                binding_entire_buffer(5, &orbit_buffers.z_norm_sqr),
-                binding_entire_buffer(6, &orbit_buffers.series_a_real),
-                binding_entire_buffer(7, &orbit_buffers.series_a_imag),
-                binding_entire_buffer(8, &orbit_buffers.series_b_real),
-                binding_entire_buffer(9, &orbit_buffers.series_b_imag),
-            ],
-        });
+    fn render_job(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        scratch: &mut ComputeScratch,
+        width: u32,
+        height: u32,
+        max_iterations: u32,
+        strategy: u32,
+        center_x: f64,
+        center_y: f64,
+        scale: f64,
+        orbit: Option<&GpuReferenceOrbit>,
+    ) -> Option<GpuRenderOutput> {
+        let pixel_count = width as u64 * height as u64;
+        let byte_len = pixel_count * 4;
+        let orbit_byte_len = orbit
+            .map(|value| std::mem::size_of_val(value.z_real.as_slice()) as u64)
+            .unwrap_or(8)
+            .max(8);
+        scratch.ensure_capacity(
+            device,
+            &self.bind_group_layout,
+            byte_len.max(4),
+            orbit_byte_len,
+        );
+        queue.write_buffer(
+            &scratch.params_buffer,
+            0,
+            &encode_gpu_params(
+                width,
+                height,
+                max_iterations,
+                strategy,
+                orbit.map_or(0, |value| value.z_real.len() as u32),
+                center_x,
+                center_y,
+                scale,
+            ),
+        );
+        scratch.write_orbit(queue, orbit);
 
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("fractal compute encoder"),
@@ -811,19 +907,32 @@ impl FractalComputeState {
                 timestamp_writes: None,
             });
             pass.set_pipeline(&self.pipeline);
-            pass.set_bind_group(0, &bind_group, &[]);
+            pass.set_bind_group(0, &scratch.bind_group, &[]);
             pass.dispatch_workgroups(
                 width.div_ceil(WORKGROUP_SIZE),
                 height.div_ceil(WORKGROUP_SIZE),
                 1,
             );
         }
-        encoder.copy_buffer_to_buffer(&output_buffer, 0, &readback_pixels, 0, byte_len);
-        encoder.copy_buffer_to_buffer(&fallback_buffer, 0, &readback_fallback, 0, byte_len);
+        encoder.copy_buffer_to_buffer(
+            &scratch.output_buffer,
+            0,
+            &scratch.readback_pixels,
+            0,
+            byte_len,
+        );
+        encoder.copy_buffer_to_buffer(
+            &scratch.fallback_buffer,
+            0,
+            &scratch.readback_fallback,
+            0,
+            byte_len,
+        );
         queue.submit(Some(encoder.finish()));
 
-        let pixels = read_buffer(device, queue, &readback_pixels, byte_len as usize)?;
-        let fallback_raw = read_buffer(device, queue, &readback_fallback, byte_len as usize)?;
+        let pixels = read_buffer(device, queue, &scratch.readback_pixels, byte_len as usize)?;
+        let fallback_raw =
+            read_buffer(device, queue, &scratch.readback_fallback, byte_len as usize)?;
         let fallback_mask = fallback_raw
             .chunks_exact(4)
             .map(|chunk| u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]) as u8)
@@ -834,22 +943,187 @@ impl FractalComputeState {
             fallback_mask,
         })
     }
+
+    fn render_perturbation_job(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        scratch: &mut ComputeScratch,
+        job: &GpuPerturbationJob,
+    ) -> Option<GpuRenderOutput> {
+        self.render_job(
+            device,
+            queue,
+            scratch,
+            job.width,
+            job.height,
+            job.max_iterations,
+            GPU_RENDER_STRATEGY_PERTURBATION,
+            job.center_x,
+            job.center_y,
+            job.scale,
+            Some(&job.orbit),
+        )
+    }
+}
+
+impl ComputeScratch {
+    fn new(device: &wgpu::Device, layout: &wgpu::BindGroupLayout) -> Self {
+        let params_buffer = create_uniform_buffer(device, 64, Some("fractal compute params"));
+        let output_buffer = create_storage_output_buffer(device, 4, Some("fractal compute pixels"));
+        let fallback_buffer =
+            create_storage_output_buffer(device, 4, Some("fractal compute fallback"));
+        let readback_pixels = create_readback_buffer(device, 4, "fractal pixels readback");
+        let readback_fallback = create_readback_buffer(device, 4, "fractal fallback readback");
+        let orbit_z_real = create_storage_upload_buffer(device, 8, Some("orbit z_real"));
+        let orbit_z_imag = create_storage_upload_buffer(device, 8, Some("orbit z_imag"));
+        let orbit_z_norm_sqr = create_storage_upload_buffer(device, 8, Some("orbit z_norm_sqr"));
+        let orbit_series_a_real =
+            create_storage_upload_buffer(device, 8, Some("orbit series_a_real"));
+        let orbit_series_a_imag =
+            create_storage_upload_buffer(device, 8, Some("orbit series_a_imag"));
+        let orbit_series_b_real =
+            create_storage_upload_buffer(device, 8, Some("orbit series_b_real"));
+        let orbit_series_b_imag =
+            create_storage_upload_buffer(device, 8, Some("orbit series_b_imag"));
+        let bind_group = create_compute_bind_group(
+            device,
+            layout,
+            &params_buffer,
+            &output_buffer,
+            &fallback_buffer,
+            &orbit_z_real,
+            &orbit_z_imag,
+            &orbit_z_norm_sqr,
+            &orbit_series_a_real,
+            &orbit_series_a_imag,
+            &orbit_series_b_real,
+            &orbit_series_b_imag,
+        );
+
+        Self {
+            params_buffer,
+            output_buffer,
+            fallback_buffer,
+            readback_pixels,
+            readback_fallback,
+            orbit_z_real,
+            orbit_z_imag,
+            orbit_z_norm_sqr,
+            orbit_series_a_real,
+            orbit_series_a_imag,
+            orbit_series_b_real,
+            orbit_series_b_imag,
+            bind_group,
+            pixel_byte_capacity: 4,
+            orbit_byte_capacity: 8,
+        }
+    }
+
+    fn ensure_capacity(
+        &mut self,
+        device: &wgpu::Device,
+        layout: &wgpu::BindGroupLayout,
+        pixel_byte_len: u64,
+        orbit_byte_len: u64,
+    ) {
+        let mut rebuild_bind_group = false;
+
+        if pixel_byte_len > self.pixel_byte_capacity {
+            self.output_buffer = create_storage_output_buffer(
+                device,
+                pixel_byte_len,
+                Some("fractal compute pixels"),
+            );
+            self.fallback_buffer = create_storage_output_buffer(
+                device,
+                pixel_byte_len,
+                Some("fractal compute fallback"),
+            );
+            self.readback_pixels =
+                create_readback_buffer(device, pixel_byte_len, "fractal pixels readback");
+            self.readback_fallback =
+                create_readback_buffer(device, pixel_byte_len, "fractal fallback readback");
+            self.pixel_byte_capacity = pixel_byte_len;
+            rebuild_bind_group = true;
+        }
+
+        if orbit_byte_len > self.orbit_byte_capacity {
+            self.orbit_z_real =
+                create_storage_upload_buffer(device, orbit_byte_len, Some("orbit z_real"));
+            self.orbit_z_imag =
+                create_storage_upload_buffer(device, orbit_byte_len, Some("orbit z_imag"));
+            self.orbit_z_norm_sqr =
+                create_storage_upload_buffer(device, orbit_byte_len, Some("orbit z_norm_sqr"));
+            self.orbit_series_a_real =
+                create_storage_upload_buffer(device, orbit_byte_len, Some("orbit series_a_real"));
+            self.orbit_series_a_imag =
+                create_storage_upload_buffer(device, orbit_byte_len, Some("orbit series_a_imag"));
+            self.orbit_series_b_real =
+                create_storage_upload_buffer(device, orbit_byte_len, Some("orbit series_b_real"));
+            self.orbit_series_b_imag =
+                create_storage_upload_buffer(device, orbit_byte_len, Some("orbit series_b_imag"));
+            self.orbit_byte_capacity = orbit_byte_len;
+            rebuild_bind_group = true;
+        }
+
+        if rebuild_bind_group {
+            self.bind_group = create_compute_bind_group(
+                device,
+                layout,
+                &self.params_buffer,
+                &self.output_buffer,
+                &self.fallback_buffer,
+                &self.orbit_z_real,
+                &self.orbit_z_imag,
+                &self.orbit_z_norm_sqr,
+                &self.orbit_series_a_real,
+                &self.orbit_series_a_imag,
+                &self.orbit_series_b_real,
+                &self.orbit_series_b_imag,
+            );
+        }
+    }
+
+    fn write_orbit(&self, queue: &wgpu::Queue, orbit: Option<&GpuReferenceOrbit>) {
+        let Some(orbit) = orbit else {
+            return;
+        };
+
+        queue.write_buffer(&self.orbit_z_real, 0, encode_f64_slice(&orbit.z_real));
+        queue.write_buffer(&self.orbit_z_imag, 0, encode_f64_slice(&orbit.z_imag));
+        queue.write_buffer(
+            &self.orbit_z_norm_sqr,
+            0,
+            encode_f64_slice(&orbit.z_norm_sqr),
+        );
+        queue.write_buffer(
+            &self.orbit_series_a_real,
+            0,
+            encode_f64_slice(&orbit.series_a_real),
+        );
+        queue.write_buffer(
+            &self.orbit_series_a_imag,
+            0,
+            encode_f64_slice(&orbit.series_a_imag),
+        );
+        queue.write_buffer(
+            &self.orbit_series_b_real,
+            0,
+            encode_f64_slice(&orbit.series_b_real),
+        );
+        queue.write_buffer(
+            &self.orbit_series_b_imag,
+            0,
+            encode_f64_slice(&orbit.series_b_imag),
+        );
+    }
 }
 
 pub enum RenderOutcome {
     Ok,
     NeedsReconfigure,
     Skipped,
-}
-
-struct OrbitBuffers {
-    z_real: wgpu::Buffer,
-    z_imag: wgpu::Buffer,
-    z_norm_sqr: wgpu::Buffer,
-    series_a_real: wgpu::Buffer,
-    series_a_imag: wgpu::Buffer,
-    series_b_real: wgpu::Buffer,
-    series_b_imag: wgpu::Buffer,
 }
 
 fn create_texture(device: &wgpu::Device, size: PhysicalSize<u32>) -> wgpu::Texture {
@@ -891,11 +1165,41 @@ fn create_bind_group(
     })
 }
 
-fn create_storage_buffer(device: &wgpu::Device, size: u64, label: Option<&str>) -> wgpu::Buffer {
+fn create_storage_buffer(
+    device: &wgpu::Device,
+    size: u64,
+    usage: wgpu::BufferUsages,
+    label: Option<&str>,
+) -> wgpu::Buffer {
     device.create_buffer(&wgpu::BufferDescriptor {
         label,
         size,
-        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        usage: wgpu::BufferUsages::STORAGE | usage,
+        mapped_at_creation: false,
+    })
+}
+
+fn create_storage_output_buffer(
+    device: &wgpu::Device,
+    size: u64,
+    label: Option<&str>,
+) -> wgpu::Buffer {
+    create_storage_buffer(device, size, wgpu::BufferUsages::COPY_SRC, label)
+}
+
+fn create_storage_upload_buffer(
+    device: &wgpu::Device,
+    size: u64,
+    label: Option<&str>,
+) -> wgpu::Buffer {
+    create_storage_buffer(device, size, wgpu::BufferUsages::COPY_DST, label)
+}
+
+fn create_uniform_buffer(device: &wgpu::Device, size: u64, label: Option<&str>) -> wgpu::Buffer {
+    device.create_buffer(&wgpu::BufferDescriptor {
+        label,
+        size,
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     })
 }
@@ -907,58 +1211,6 @@ fn create_readback_buffer(device: &wgpu::Device, size: u64, label: &str) -> wgpu
         usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
         mapped_at_creation: false,
     })
-}
-
-fn create_buffer_with_data(
-    device: &wgpu::Device,
-    queue: &wgpu::Queue,
-    data: &[u8],
-    usage: wgpu::BufferUsages,
-    label: Option<&str>,
-) -> wgpu::Buffer {
-    let buffer = device.create_buffer(&wgpu::BufferDescriptor {
-        label,
-        size: data.len().max(8) as u64,
-        usage: usage | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
-    if !data.is_empty() {
-        queue.write_buffer(&buffer, 0, data);
-    }
-    buffer
-}
-
-fn create_orbit_buffers(
-    device: &wgpu::Device,
-    queue: &wgpu::Queue,
-    orbit: Option<&()>,
-    dummy: &wgpu::Buffer,
-) -> OrbitBuffers {
-    let make = |label: &str, values: Option<&[f64]>| -> wgpu::Buffer {
-        match values {
-            Some(values) if !values.is_empty() => {
-                create_buffer_with_data(
-                    device,
-                    queue,
-                    encode_f64_slice(values),
-                    wgpu::BufferUsages::STORAGE,
-                    Some(label),
-                )
-            }
-            _ => dummy.clone(),
-        }
-    };
-    let _ = orbit;
-
-    OrbitBuffers {
-        z_real: make("orbit z_real", None),
-        z_imag: make("orbit z_imag", None),
-        z_norm_sqr: make("orbit z_norm_sqr", None),
-        series_a_real: make("orbit series_a_real", None),
-        series_a_imag: make("orbit series_a_imag", None),
-        series_b_real: make("orbit series_b_real", None),
-        series_b_imag: make("orbit series_b_imag", None),
-    }
 }
 
 fn encode_gpu_params(
@@ -998,6 +1250,39 @@ fn binding_entire_buffer(binding: u32, buffer: &wgpu::Buffer) -> wgpu::BindGroup
         binding,
         resource: buffer.as_entire_binding(),
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn create_compute_bind_group(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    params_buffer: &wgpu::Buffer,
+    output_buffer: &wgpu::Buffer,
+    fallback_buffer: &wgpu::Buffer,
+    orbit_z_real: &wgpu::Buffer,
+    orbit_z_imag: &wgpu::Buffer,
+    orbit_z_norm_sqr: &wgpu::Buffer,
+    orbit_series_a_real: &wgpu::Buffer,
+    orbit_series_a_imag: &wgpu::Buffer,
+    orbit_series_b_real: &wgpu::Buffer,
+    orbit_series_b_imag: &wgpu::Buffer,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("fractal compute bind group"),
+        layout,
+        entries: &[
+            binding_entire_buffer(0, params_buffer),
+            binding_entire_buffer(1, output_buffer),
+            binding_entire_buffer(2, fallback_buffer),
+            binding_entire_buffer(3, orbit_z_real),
+            binding_entire_buffer(4, orbit_z_imag),
+            binding_entire_buffer(5, orbit_z_norm_sqr),
+            binding_entire_buffer(6, orbit_series_a_real),
+            binding_entire_buffer(7, orbit_series_a_imag),
+            binding_entire_buffer(8, orbit_series_b_real),
+            binding_entire_buffer(9, orbit_series_b_imag),
+        ],
+    })
 }
 
 fn read_buffer(

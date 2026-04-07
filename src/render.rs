@@ -11,7 +11,10 @@ use dashu_int::IBig;
 use num_traits::Zero;
 use rayon::prelude::*;
 
-use crate::math::{BigFixed, ViewportState, mul_fixed_raw, raw_to_f64};
+use crate::{
+    gpu::HeadlessComputeRenderer,
+    math::{BigFixed, ViewportState, mul_fixed_raw, raw_to_f64},
+};
 
 const TILE_SIZE: u32 = 96;
 const FAST_PATH_SCALE_THRESHOLD: f64 = 1.0e-18;
@@ -37,6 +40,15 @@ pub struct RenderRequest {
 }
 
 pub enum RenderMessage {
+    FullFrame {
+        generation: u64,
+        width: u32,
+        height: u32,
+        pixels: Vec<u8>,
+    },
+    Finished {
+        generation: u64,
+    },
     Started {
         generation: u64,
         pending_tiles: Vec<(u32, u32, u32, u32)>,
@@ -69,6 +81,26 @@ struct ReferenceOrbit {
     series_b_imag: Vec<f64>,
 }
 
+pub struct GpuReferenceOrbit {
+    pub z_real: Vec<f64>,
+    pub z_imag: Vec<f64>,
+    pub z_norm_sqr: Vec<f64>,
+    pub series_a_real: Vec<f64>,
+    pub series_a_imag: Vec<f64>,
+    pub series_b_real: Vec<f64>,
+    pub series_b_imag: Vec<f64>,
+}
+
+pub struct GpuPerturbationJob {
+    pub width: u32,
+    pub height: u32,
+    pub center_x: f64,
+    pub center_y: f64,
+    pub scale: f64,
+    pub max_iterations: u32,
+    pub orbit: GpuReferenceOrbit,
+}
+
 pub enum GpuRenderParams {
     FastF64 {
         width: u32,
@@ -78,6 +110,7 @@ pub enum GpuRenderParams {
         scale: f64,
         max_iterations: u32,
     },
+    Perturbation(GpuPerturbationJob),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -113,16 +146,71 @@ pub fn spawn_render_worker() -> (
     let latest_generation_for_thread = latest_generation.clone();
 
     thread::spawn(move || {
+        let mut gpu = pollster::block_on(HeadlessComputeRenderer::new());
         while let Ok(mut request) = request_rx.recv() {
             while let Ok(newer_request) = request_rx.try_recv() {
                 request = newer_request;
             }
 
-            render_progressive(&request, &latest_generation_for_thread, &result_tx);
+            if matches!(
+                render_strategy_for_request(&request),
+                RenderStrategy::FastF64
+            ) && render_full_frame_gpu(
+                &request,
+                &latest_generation_for_thread,
+                &result_tx,
+                gpu.as_mut(),
+            ) {
+                continue;
+            }
+
+            render_progressive(
+                &request,
+                &latest_generation_for_thread,
+                &result_tx,
+                gpu.as_mut(),
+            );
         }
     });
 
     (request_tx, result_rx, latest_generation)
+}
+
+fn render_full_frame_gpu(
+    request: &RenderRequest,
+    latest_generation: &AtomicU64,
+    result_tx: &Sender<RenderMessage>,
+    gpu: Option<&mut HeadlessComputeRenderer>,
+) -> bool {
+    let Some(gpu) = gpu else {
+        return false;
+    };
+    let Some(params) = prepare_gpu_render(request) else {
+        return false;
+    };
+    let Some(mut output) = gpu.render_fractal_to_pixels(&params) else {
+        return false;
+    };
+
+    if latest_generation.load(Ordering::Relaxed) != request.generation {
+        return true;
+    }
+
+    if output.fallback_mask.iter().any(|flag| *flag != 0) {
+        patch_exact_pixels(request, &mut output.pixels, &output.fallback_mask);
+    }
+
+    if latest_generation.load(Ordering::Relaxed) != request.generation {
+        return true;
+    }
+
+    let _ = result_tx.send(RenderMessage::FullFrame {
+        generation: request.generation,
+        width: request.width,
+        height: request.height,
+        pixels: output.pixels,
+    });
+    true
 }
 
 pub fn recommended_iterations(scale: &BigFixed) -> u32 {
@@ -182,7 +270,9 @@ pub fn prepare_gpu_render(request: &RenderRequest) -> Option<GpuRenderParams> {
             scale,
             max_iterations: request.max_iterations,
         }),
-        RenderStrategy::Perturbation => None,
+        RenderStrategy::Perturbation => Some(GpuRenderParams::Perturbation(
+            build_gpu_perturbation_job(request),
+        )),
         RenderStrategy::Exact => None,
     }
 }
@@ -209,28 +299,68 @@ fn render_progressive(
     request: &RenderRequest,
     latest_generation: &AtomicU64,
     result_tx: &Sender<RenderMessage>,
+    mut gpu: Option<&mut HeadlessComputeRenderer>,
 ) {
     let strategy = render_strategy_for_request(request);
-    let reference = if matches!(strategy, RenderStrategy::Perturbation) {
-        Some(Arc::new(build_reference_orbit(request)))
-    } else {
-        None
-    };
 
-    for phase in 0..4 {
-        if latest_generation.load(Ordering::Relaxed) != request.generation {
-            return;
+    if latest_generation.load(Ordering::Relaxed) != request.generation {
+        return;
+    }
+
+    let tiles = center_out_tiles(request.width, request.height, TILE_SIZE);
+    let _ = result_tx.send(RenderMessage::Started {
+        generation: request.generation,
+        pending_tiles: tiles
+            .iter()
+            .map(|tile| (tile.x, tile.y, tile.width, tile.height))
+            .collect(),
+    });
+
+    if let Some(gpu) = gpu.as_deref_mut() {
+        let mut cpu_reference = None;
+        for tile in tiles {
+            if latest_generation.load(Ordering::Relaxed) != request.generation {
+                return;
+            }
+
+            let pixels = render_tile_gpu(request, tile, gpu).unwrap_or_else(|| {
+                let reference = cpu_reference_for_strategy(request, strategy, &mut cpu_reference);
+                render_tile(request, tile, strategy, reference)
+            });
+            let _ = result_tx.send(RenderMessage::Tile {
+                generation: request.generation,
+                x: tile.x,
+                y: tile.y,
+                width: tile.width,
+                height: tile.height,
+                pixels,
+            });
+        }
+    } else {
+        let reference = if matches!(strategy, RenderStrategy::Perturbation) {
+            Some(Arc::new(build_reference_orbit(request)))
+        } else {
+            None
+        };
+        let mut remaining_tiles = tiles;
+        if !remaining_tiles.is_empty() {
+            let tile = remaining_tiles.remove(0);
+            if latest_generation.load(Ordering::Relaxed) != request.generation {
+                return;
+            }
+
+            let pixels = render_tile(request, tile, strategy, reference.as_deref());
+            let _ = result_tx.send(RenderMessage::Tile {
+                generation: request.generation,
+                x: tile.x,
+                y: tile.y,
+                width: tile.width,
+                height: tile.height,
+                pixels,
+            });
         }
 
-        let tiles = tiles_for_phase(request.width, request.height, phase);
-        let _ = result_tx.send(RenderMessage::Started {
-            generation: request.generation,
-            pending_tiles: tiles
-                .iter()
-                .map(|tile| (tile.x, tile.y, tile.width, tile.height))
-                .collect(),
-        });
-        tiles
+        remaining_tiles
             .into_par_iter()
             .for_each_with(result_tx.clone(), |tx, tile| {
                 if latest_generation.load(Ordering::Relaxed) != request.generation {
@@ -248,33 +378,127 @@ fn render_progressive(
                 });
             });
     }
+
+    if latest_generation.load(Ordering::Relaxed) == request.generation {
+        let _ = result_tx.send(RenderMessage::Finished {
+            generation: request.generation,
+        });
+    }
 }
 
-fn tiles_for_phase(width: u32, height: u32, phase: u32) -> Vec<TileRect> {
-    let tiles_x = width.div_ceil(TILE_SIZE);
-    let tiles_y = height.div_ceil(TILE_SIZE);
-    let parity_x = phase % 2;
-    let parity_y = phase / 2;
-    let mut tiles = Vec::new();
+fn cpu_reference_for_strategy<'a>(
+    request: &RenderRequest,
+    strategy: RenderStrategy,
+    reference: &'a mut Option<Arc<ReferenceOrbit>>,
+) -> Option<&'a ReferenceOrbit> {
+    if !matches!(strategy, RenderStrategy::Perturbation) {
+        return None;
+    }
+
+    let reference = reference.get_or_insert_with(|| Arc::new(build_reference_orbit(request)));
+    Some(reference.as_ref())
+}
+
+fn center_out_tiles(width: u32, height: u32, tile_size: u32) -> Vec<TileRect> {
+    let tiles_x = width.div_ceil(tile_size);
+    let tiles_y = height.div_ceil(tile_size);
+    let mut tiles = Vec::with_capacity((tiles_x * tiles_y) as usize);
+    let center_x = width as f64 * 0.5;
+    let center_y = height as f64 * 0.5;
 
     for tile_y in 0..tiles_y {
         for tile_x in 0..tiles_x {
-            if tile_x % 2 != parity_x || tile_y % 2 != parity_y {
-                continue;
-            }
-
-            let x = tile_x * TILE_SIZE;
-            let y = tile_y * TILE_SIZE;
+            let x = tile_x * tile_size;
+            let y = tile_y * tile_size;
             tiles.push(TileRect {
                 x,
                 y,
-                width: (width - x).min(TILE_SIZE),
-                height: (height - y).min(TILE_SIZE),
+                width: (width - x).min(tile_size),
+                height: (height - y).min(tile_size),
+            });
+        }
+    }
+
+    tiles.sort_by(|lhs, rhs| {
+        tile_center_distance_squared(*lhs, center_x, center_y)
+            .total_cmp(&tile_center_distance_squared(*rhs, center_x, center_y))
+    });
+    tiles
+}
+
+#[cfg(test)]
+fn all_tiles(width: u32, height: u32, tile_size: u32) -> Vec<TileRect> {
+    let tiles_x = width.div_ceil(tile_size);
+    let tiles_y = height.div_ceil(tile_size);
+    let mut tiles = Vec::with_capacity((tiles_x * tiles_y) as usize);
+
+    for tile_y in 0..tiles_y {
+        for tile_x in 0..tiles_x {
+            let x = tile_x * tile_size;
+            let y = tile_y * tile_size;
+            tiles.push(TileRect {
+                x,
+                y,
+                width: (width - x).min(tile_size),
+                height: (height - y).min(tile_size),
             });
         }
     }
 
     tiles
+}
+
+fn tile_center_distance_squared(tile: TileRect, center_x: f64, center_y: f64) -> f64 {
+    let tile_center_x = tile.x as f64 + tile.width as f64 * 0.5;
+    let tile_center_y = tile.y as f64 + tile.height as f64 * 0.5;
+    let dx = tile_center_x - center_x;
+    let dy = tile_center_y - center_y;
+    dx * dx + dy * dy
+}
+
+fn render_tile_gpu(
+    request: &RenderRequest,
+    tile: TileRect,
+    gpu: &mut HeadlessComputeRenderer,
+) -> Option<Vec<u8>> {
+    let tile_request = tile_request(request, tile);
+    let params = prepare_gpu_render(&tile_request)?;
+    let mut output = gpu.render_fractal_to_pixels(&params)?;
+
+    if output.fallback_mask.iter().any(|flag| *flag != 0) {
+        patch_exact_pixels(&tile_request, &mut output.pixels, &output.fallback_mask);
+    }
+
+    Some(output.pixels)
+}
+
+fn tile_request(request: &RenderRequest, tile: TileRect) -> RenderRequest {
+    let frac_bits = request.frac_bits;
+    let half_width = request.width as f64 * 0.5;
+    let half_height = request.height as f64 * 0.5;
+    let tile_center_x = tile.x as f64 + tile.width as f64 * 0.5;
+    let tile_center_y = tile.y as f64 + tile.height as f64 * 0.5;
+    let dx = BigFixed::from_f64(tile_center_x - half_width, frac_bits);
+    let dy = BigFixed::from_f64(tile_center_y - half_height, frac_bits);
+    let offset_x = mul_fixed_raw(&request.scale.raw, &dx.raw, frac_bits);
+    let offset_y = mul_fixed_raw(&request.scale.raw, &dy.raw, frac_bits);
+
+    RenderRequest {
+        generation: request.generation,
+        width: tile.width,
+        height: tile.height,
+        frac_bits,
+        center_x: BigFixed {
+            raw: &request.center_x.raw + offset_x,
+            frac_bits,
+        },
+        center_y: BigFixed {
+            raw: &request.center_y.raw + offset_y,
+            frac_bits,
+        },
+        scale: request.scale.clone(),
+        max_iterations: request.max_iterations,
+    }
 }
 
 fn render_tile(
@@ -468,22 +692,21 @@ pub fn patch_exact_pixels(request: &RenderRequest, pixels: &mut [u8], fallback_m
                 &request.center_x.raw + mul_fixed_raw(&request.scale.raw, &start_x.raw, frac_bits);
             let imag =
                 &request.center_y.raw + mul_fixed_raw(&request.scale.raw, &y_fixed.raw, frac_bits);
+            let mut real = start_real;
 
             for (x, flag) in mask_row.iter().copied().enumerate() {
-                if flag == 0 {
-                    continue;
+                if flag != 0 {
+                    let color = mandelbrot_color_fixed(
+                        &real,
+                        &imag,
+                        request.max_iterations,
+                        request.frac_bits,
+                    );
+                    let offset = x * 4;
+                    row_pixels[offset..offset + 4].copy_from_slice(&color);
                 }
-
-                let x_fixed = BigFixed::from_f64(x as f64 - half_width, frac_bits);
-                let real =
-                    &request.center_x.raw + mul_fixed_raw(&request.scale.raw, &x_fixed.raw, frac_bits);
-                let color =
-                    mandelbrot_color_fixed(&real, &imag, request.max_iterations, request.frac_bits);
-                let offset = x * 4;
-                row_pixels[offset..offset + 4].copy_from_slice(&color);
+                real += &request.scale.raw;
             }
-
-            let _ = start_real;
         });
 }
 
@@ -549,6 +772,39 @@ fn build_reference_orbit(request: &RenderRequest) -> ReferenceOrbit {
         request.frac_bits,
         request.max_iterations,
     )
+}
+
+fn build_gpu_perturbation_job(request: &RenderRequest) -> GpuPerturbationJob {
+    let reference_offset_real = pixel_offset_real_raw(request, request.width as f64 * 0.5 - 0.5);
+    let reference_offset_imag = pixel_offset_imag_raw(request, request.height as f64 * 0.5 - 0.5);
+    let center_x = raw_fixed_to_f64(
+        &(&request.center_x.raw + &reference_offset_real),
+        request.frac_bits,
+    );
+    let center_y = raw_fixed_to_f64(
+        &(&request.center_y.raw + &reference_offset_imag),
+        request.frac_bits,
+    );
+    let orbit =
+        build_reference_orbit_at_offset(request, &reference_offset_real, &reference_offset_imag);
+
+    GpuPerturbationJob {
+        width: request.width,
+        height: request.height,
+        center_x,
+        center_y,
+        scale: request.scale.to_f64(),
+        max_iterations: request.max_iterations,
+        orbit: GpuReferenceOrbit {
+            z_real: orbit.z_real,
+            z_imag: orbit.z_imag,
+            z_norm_sqr: orbit.z_norm_sqr,
+            series_a_real: orbit.series_a_real,
+            series_a_imag: orbit.series_a_imag,
+            series_b_real: orbit.series_b_real,
+            series_b_imag: orbit.series_b_imag,
+        },
+    }
 }
 
 fn build_reference_orbit_at_offset(
@@ -792,12 +1048,7 @@ fn pixel_offset_imag_raw(request: &RenderRequest, pixel_y: f64) -> IBig {
     mul_fixed_raw(&request.scale.raw, &dy.raw, request.frac_bits)
 }
 
-fn mandelbrot_color_fixed(
-    cx: &IBig,
-    cy: &IBig,
-    max_iterations: u32,
-    frac_bits: u32,
-) -> [u8; 4] {
+fn mandelbrot_color_fixed(cx: &IBig, cy: &IBig, max_iterations: u32, frac_bits: u32) -> [u8; 4] {
     let mut zx = IBig::zero();
     let mut zy = IBig::zero();
     let escape_limit = IBig::from(4_u8) << frac_bits as usize;
@@ -964,5 +1215,236 @@ mod tests {
         let center = BigFixed::from_f64(-0.5, frac_bits);
         assert!(!f64_axis_has_pixel_resolution(&center, 4.708e-18, 1280));
         assert!(f64_axis_has_pixel_resolution(&center, 1.0e-12, 1280));
+    }
+}
+
+#[cfg(test)]
+mod perf_tests {
+    use rayon::prelude::*;
+    use std::time::Instant;
+
+    use super::{
+        RenderRequest, TILE_SIZE, all_tiles, build_reference_orbit, patch_exact_pixels,
+        prepare_gpu_render, render_tile_fixed, render_tile_perturbation,
+    };
+    use crate::{
+        gpu::HeadlessComputeRenderer,
+        math::{BigFixed, ViewportState},
+    };
+
+    fn superzoom_request(width: u32, height: u32, scale: f64, frac_bits: u32) -> RenderRequest {
+        let viewport = ViewportState {
+            width,
+            height,
+            frac_bits,
+            center_x: BigFixed::from_f64(-0.743_643_887_037_151, frac_bits),
+            center_y: BigFixed::from_f64(0.131_825_904_205_33, frac_bits),
+            scale: BigFixed::from_f64(scale, frac_bits),
+        };
+        RenderRequest::from_viewport(&viewport, 0)
+    }
+
+    fn blit_tile(
+        frame: &mut [u8],
+        frame_width: u32,
+        x: u32,
+        y: u32,
+        width: u32,
+        height: u32,
+        tile: &[u8],
+    ) {
+        let frame_stride = frame_width as usize * 4;
+        let tile_stride = width as usize * 4;
+        for row in 0..height as usize {
+            let dst_start = (y as usize + row) * frame_stride + x as usize * 4;
+            let src_start = row * tile_stride;
+            frame[dst_start..dst_start + tile_stride]
+                .copy_from_slice(&tile[src_start..src_start + tile_stride]);
+        }
+    }
+
+    fn render_full_frame_cpu_exact(request: &RenderRequest) -> Vec<u8> {
+        let mut pixels = vec![0; request.width as usize * request.height as usize * 4];
+        let rendered_tiles: Vec<_> = all_tiles(request.width, request.height, TILE_SIZE)
+            .into_par_iter()
+            .map(|tile| (tile, render_tile_fixed(request, tile)))
+            .collect();
+        for (tile, tile_pixels) in rendered_tiles {
+            blit_tile(
+                &mut pixels,
+                request.width,
+                tile.x,
+                tile.y,
+                tile.width,
+                tile.height,
+                &tile_pixels,
+            );
+        }
+        pixels
+    }
+
+    fn render_full_frame_cpu_perturbation(request: &RenderRequest) -> Vec<u8> {
+        let reference = build_reference_orbit(request);
+        let mut pixels = vec![0; request.width as usize * request.height as usize * 4];
+        let rendered_tiles: Vec<_> = all_tiles(request.width, request.height, TILE_SIZE)
+            .into_par_iter()
+            .map(|tile| (tile, render_tile_perturbation(request, tile, &reference)))
+            .collect();
+        for (tile, tile_pixels) in rendered_tiles {
+            blit_tile(
+                &mut pixels,
+                request.width,
+                tile.x,
+                tile.y,
+                tile.width,
+                tile.height,
+                &tile_pixels,
+            );
+        }
+        pixels
+    }
+
+    #[test]
+    #[ignore = "manual performance benchmark"]
+    fn perf_superzoom_compare_strategies() {
+        let cases = [
+            ("2.8e-17", true, superzoom_request(320, 180, 2.8e-17, 224)),
+            ("1.0e-18", false, superzoom_request(320, 180, 1.0e-18, 256)),
+        ];
+
+        let mut gpu = pollster::block_on(HeadlessComputeRenderer::new());
+
+        for (label, run_exact, request) in cases {
+            println!(
+                "\n== superzoom scale {} | {}x{} | iter {} ==",
+                label, request.width, request.height, request.max_iterations
+            );
+
+            if run_exact {
+                let started = Instant::now();
+                let _cpu_exact = render_full_frame_cpu_exact(&request);
+                println!("cpu_exact: {:?}", started.elapsed());
+            } else {
+                println!("cpu_exact: skipped for this case");
+            }
+
+            let started = Instant::now();
+            let _cpu_perturbation = render_full_frame_cpu_perturbation(&request);
+            println!("cpu_perturbation: {:?}", started.elapsed());
+
+            if let Some(gpu) = gpu.as_mut() {
+                let prepare_started = Instant::now();
+                if let Some(params) = prepare_gpu_render(&request) {
+                    let prepare_elapsed = prepare_started.elapsed();
+                    let started = Instant::now();
+                    let mut output = gpu
+                        .render_fractal_to_pixels(&params)
+                        .expect("gpu render failed");
+                    let gpu_elapsed = started.elapsed();
+                    let fallback_count = output
+                        .fallback_mask
+                        .iter()
+                        .filter(|flag| **flag != 0)
+                        .count();
+                    if fallback_count != 0 {
+                        let patch_started = Instant::now();
+                        patch_exact_pixels(&request, &mut output.pixels, &output.fallback_mask);
+                        println!(
+                            "gpu_prepare: {:?} | gpu_render: {:?} | fallback {} | patch_exact: {:?}",
+                            prepare_elapsed,
+                            gpu_elapsed,
+                            fallback_count,
+                            patch_started.elapsed()
+                        );
+                    } else {
+                        println!(
+                            "gpu_prepare: {:?} | gpu_render: {:?} | fallback 0",
+                            prepare_elapsed, gpu_elapsed
+                        );
+                    }
+                } else {
+                    println!("gpu_render: skipped for this strategy");
+                }
+            } else {
+                println!("gpu_render: skipped, no headless f64-capable adapter");
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "manual performance benchmark"]
+    fn perf_superzoom_gpu_matches_frame_shape() {
+        let request = superzoom_request(320, 180, 2.8e-17, 224);
+        let mut gpu = match pollster::block_on(HeadlessComputeRenderer::new()) {
+            Some(gpu) => gpu,
+            None => {
+                println!("skipping: no headless f64-capable adapter");
+                return;
+            }
+        };
+
+        let params = prepare_gpu_render(&request).expect("expected gpu plan");
+        let mut output = gpu
+            .render_fractal_to_pixels(&params)
+            .expect("gpu render failed");
+        patch_exact_pixels(&request, &mut output.pixels, &output.fallback_mask);
+
+        assert_eq!(
+            output.pixels.len(),
+            request.width as usize * request.height as usize * 4
+        );
+        assert_eq!(
+            output.fallback_mask.len(),
+            request.width as usize * request.height as usize
+        );
+    }
+
+    #[test]
+    #[ignore = "manual performance benchmark"]
+    fn perf_superzoom_gpu_full_frame() {
+        let cases = [
+            superzoom_request(1280, 720, 2.8e-17, 224),
+            superzoom_request(1920, 1080, 2.8e-17, 224),
+        ];
+        let mut gpu = match pollster::block_on(HeadlessComputeRenderer::new()) {
+            Some(gpu) => gpu,
+            None => {
+                println!("skipping: no headless f64-capable adapter");
+                return;
+            }
+        };
+
+        for request in cases {
+            let prepare_started = Instant::now();
+            let params = prepare_gpu_render(&request).expect("expected gpu plan");
+            let prepare_elapsed = prepare_started.elapsed();
+            let render_started = Instant::now();
+            let mut output = gpu
+                .render_fractal_to_pixels(&params)
+                .expect("gpu render failed");
+            let render_elapsed = render_started.elapsed();
+            let fallback_count = output
+                .fallback_mask
+                .iter()
+                .filter(|flag| **flag != 0)
+                .count();
+            let patch_elapsed = if fallback_count == 0 {
+                None
+            } else {
+                let patch_started = Instant::now();
+                patch_exact_pixels(&request, &mut output.pixels, &output.fallback_mask);
+                Some(patch_started.elapsed())
+            };
+
+            println!(
+                "gpu_full_frame: {}x{} | prepare {:?} | render {:?} | fallback {} | patch {:?}",
+                request.width,
+                request.height,
+                prepare_elapsed,
+                render_elapsed,
+                fallback_count,
+                patch_elapsed
+            );
+        }
     }
 }
